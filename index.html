@@ -19,6 +19,49 @@
   </style>
 </head>
 <body>
-  <iframe src="kookboek-v15-updated-specials-1.html" title="Buikboek"></iframe>
+  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=saus-korean-1" title="Buikboek"></iframe>
+  <script>
+    function addKoreanSauce(){
+      const frame=document.getElementById('buikboek-frame');
+      const doc=frame.contentDocument||frame.contentWindow.document;
+      if(!doc||doc.getElementById('sticky-korean-honey-chili-saus')) return;
+      const card=doc.createElement('article');
+      card.className='recipe-card';
+      card.id='sticky-korean-honey-chili-saus';
+      card.innerHTML=`
+        <div class="recipe-head">
+          <div class="emoji">🍯🌶️</div>
+          <div>
+            <h3>Sticky Korean Honey Chili Saus</h3>
+            <p>Pittig zoet • honingachtig • zonder koken</p>
+          </div>
+        </div>
+        <ul>
+          <li>3 el honing</li>
+          <li>1 el gochujang</li>
+          <li>1 el sweet chilisaus</li>
+          <li>1 tl sojasaus</li>
+          <li>1 tl rijstazijn of natuurazijn</li>
+          <li>Klein scheutje sesamolie, optioneel</li>
+          <li>Snufje MSG, optioneel</li>
+        </ul>
+        <div class="method"><b>Bereiding:</b> Alles koud mengen tot een gladde sticky saus. Over hete krokante kip doen of als dipsaus gebruiken. Meer honing = zoeter, meer gochujang = pittiger, meer azijn = frisser.</div>
+      `;
+      const sections=[...doc.querySelectorAll('.section')];
+      let sauceSection=sections.find(s=>/saus|sauzen/i.test((s.querySelector('h2')?.textContent||'')));
+      if(!sauceSection){
+        sauceSection=doc.createElement('section');
+        sauceSection.className='section gold';
+        sauceSection.id='sauzen';
+        sauceSection.innerHTML='<h2>SAUZEN</h2><div class="grid"></div>';
+        const footer=doc.querySelector('.footer');
+        if(footer) footer.before(sauceSection); else doc.body.appendChild(sauceSection);
+      }
+      let grid=sauceSection.querySelector('.grid');
+      if(!grid){grid=doc.createElement('div');grid.className='grid';sauceSection.appendChild(grid)}
+      grid.appendChild(card);
+    }
+    document.getElementById('buikboek-frame').addEventListener('load',()=>setTimeout(addKoreanSauce,300));
+  </script>
 </body>
 </html>
