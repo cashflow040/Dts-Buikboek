@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>Buikboek</title>
-  <link rel="icon" type="image/jpeg" sizes="192x192" href="buikboek-icon-192.jpg?v=201">
-  <link rel="shortcut icon" type="image/jpeg" href="buikboek-icon-192.jpg?v=201">
-  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?v=11">
-  <link rel="manifest" href="site.webmanifest?v=201">
+  <link rel="icon" type="image/jpeg" sizes="192x192" href="buikboek-icon-192.jpg?v=202">
+  <link rel="shortcut icon" type="image/jpeg" href="buikboek-icon-192.jpg?v=202">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?v=12">
+  <link rel="manifest" href="site.webmanifest?v=202">
   <meta name="theme-color" content="#090806">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Buikboek">
@@ -19,16 +19,17 @@
   </style>
 </head>
 <body>
-  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=buikboek-201" title="Buikboek"></iframe>
+  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=buikboek-202" title="Buikboek"></iframe>
   <script>
     (function(){
-      function makeCard(doc,id,emoji,title,subtitle,ingredients,method){
+      function makeCard(doc,id,emoji,title,subtitle,ingredients,method,imageSrc){
         var card=doc.createElement('article');
         card.className='recipe-card';
         card.id=id;
         var list='';
         for(var i=0;i<ingredients.length;i++) list+='<li>'+ingredients[i]+'</li>';
-        card.innerHTML='<div class="recipe-head"><div class="emoji">'+emoji+'</div><div><h3>'+title+'</h3><p>'+subtitle+'</p></div></div><ul>'+list+'</ul><div class="method"><b>Bereiding:</b> '+method+'</div>';
+        var photo=imageSrc?'<img class="recipe-photo" src="'+imageSrc+'" alt="'+title+'" loading="lazy">':'';
+        card.innerHTML=photo+'<div class="recipe-head"><div class="emoji">'+emoji+'</div><div><h3>'+title+'</h3><p>'+subtitle+'</p></div></div><ul>'+list+'</ul><div class="method"><b>Bereiding:</b> '+method+'</div>';
         return card;
       }
 
@@ -85,7 +86,7 @@
         addNavLink(doc,sauces.id,'Sausjes & Dips');
 
         if(!doc.getElementById('sticky-korean-honey-chili-saus')){
-          gridFor(doc,sauces).appendChild(makeCard(doc,'sticky-korean-honey-chili-saus','🍯🌶️','Sticky Korean Honey Chili Saus','Pittig zoet • honingachtig • zonder koken',['3 el honing','1 el gochujang','1 el sweet chilisaus','1 tl sojasaus','1 tl rijstazijn of natuurazijn','Klein scheutje sesamolie, optioneel','Snufje MSG, optioneel'],'Meng alles koud tot een gladde, kleverige saus. Lekker over hete krokante kip of als dip. Meer honing maakt hem zoeter, meer gochujang pittiger en meer azijn frisser.'));
+          gridFor(doc,sauces).appendChild(makeCard(doc,'sticky-korean-honey-chili-saus','🍯🌶️','Sticky Korean Honey Chili Saus','Pittig zoet • honingachtig • zonder koken',['3 el honing','1 el gochujang','1 el sweet chilisaus','1 tl sojasaus','1 tl rijstazijn of natuurazijn','Klein scheutje sesamolie, optioneel','Snufje MSG, optioneel'],'Meng alles koud tot een gladde, kleverige saus. Lekker over hete krokante kip of als dip. Meer honing maakt hem zoeter, meer gochujang pittiger en meer azijn frisser.','images/sticky-korean-honey-chili-ai.svg?v=1'));
         }
 
         var sides=findSection(doc,['bijgerechten']);
@@ -100,7 +101,7 @@
         addNavLink(doc,sides.id,'Bijgerechten');
 
         if(!doc.getElementById('crostini-di-fegatini')){
-          gridFor(doc,sides).appendChild(makeCard(doc,'crostini-di-fegatini','🇮🇹🍞','Crostini di Fegatini','Toscaanse kippenleverpaté • licht korrelig • voor op brood',['500 g kippenlevers','1 ui, fijngesneden','2 tenen knoflook, fijngehakt','3 el olijfolie','50 g boter','100 ml droge witte wijn','5–6 salieblaadjes','2 ansjovisfilets','1 el kappertjes','Zout en zwarte peper'],'Bak de ui 8–10 minuten zacht in olijfolie. Voeg knoflook, salie, ansjovis en kappertjes toe. Bak de kippenlevers 4–5 minuten mee, blus af met witte wijn en laat bijna volledig inkoken. Voeg de boter toe en pulseer kort, zodat de paté bewust licht grof en korrelig blijft. Laat minimaal 2 uur koelen en serveer op geroosterd brood.'));
+          gridFor(doc,sides).appendChild(makeCard(doc,'crostini-di-fegatini','🇮🇹🍞','Crostini di Fegatini','Toscaanse kippenleverpaté • licht korrelig • voor op brood',['500 g kippenlevers','1 ui, fijngesneden','2 tenen knoflook, fijngehakt','3 el olijfolie','50 g boter','100 ml droge witte wijn','5–6 salieblaadjes','2 ansjovisfilets','1 el kappertjes','Zout en zwarte peper'],'Bak de ui 8–10 minuten zacht in olijfolie. Voeg knoflook, salie, ansjovis en kappertjes toe. Bak de kippenlevers 4–5 minuten mee, blus af met witte wijn en laat bijna volledig inkoken. Voeg de boter toe en pulseer kort, zodat de paté bewust licht grof en korrelig blijft. Laat minimaal 2 uur koelen en serveer op geroosterd brood.','images/crostini-di-fegatini-ai.svg?v=1'));
         }
         return !!doc.getElementById('sticky-korean-honey-chili-saus') && !!doc.getElementById('crostini-di-fegatini');
       }
