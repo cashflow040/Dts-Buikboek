@@ -16,52 +16,39 @@
   <style>
     html,body{margin:0;width:100%;height:100%;background:#090806;overflow:hidden}
     iframe{position:fixed;inset:0;width:100%;height:100%;border:0;background:#090806}
+    #nieuw-knop{position:fixed;right:16px;bottom:18px;z-index:99999;border:1px solid #e5bd63;background:#17130e;color:#f5e3b6;border-radius:999px;padding:13px 17px;font:700 14px Arial,sans-serif;box-shadow:0 8px 28px #000a}
+    #nieuw-paneel{display:none;position:fixed;inset:0;z-index:100000;background:#000c;overflow:auto;padding:18px;box-sizing:border-box}
+    #nieuw-paneel.open{display:block}
+    .nieuw-wrap{max-width:760px;margin:24px auto;background:#0e0c09;border:1px solid #8f6b2d;border-radius:22px;padding:18px;box-shadow:0 20px 60px #000}
+    .nieuw-top{display:flex;align-items:center;justify-content:space-between;gap:12px}.nieuw-top h2{margin:0;color:#e5bd63;font:800 24px Arial,sans-serif}.sluit{border:0;background:#2a241b;color:#fff;border-radius:10px;padding:9px 12px;font-size:18px}
+    .recept{display:block;margin-top:14px;padding:17px;border:1px solid #5b4724;border-radius:16px;background:#17130e;color:#f5ead3;text-decoration:none;font-family:Arial,sans-serif}.recept h3{margin:0 0 7px;color:#f0d497;font-size:19px}.recept p{margin:0;color:#d5c7ab;line-height:1.45}.badge{display:inline-block;margin-top:10px;background:#e5bd63;color:#17130e;border-radius:999px;padding:7px 10px;font-weight:800;font-size:12px}
   </style>
 </head>
 <body>
-  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=saus-korean-1" title="Buikboek"></iframe>
+  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=nieuw-recepten-2" title="Buikboek"></iframe>
+
+  <button id="nieuw-knop" type="button">✨ Nieuwe recepten (2)</button>
+  <div id="nieuw-paneel" aria-hidden="true">
+    <div class="nieuw-wrap">
+      <div class="nieuw-top"><h2>Nieuw in je Buikboek</h2><button class="sluit" id="sluit-paneel" type="button">✕</button></div>
+      <a class="recept" href="recepten/crostini-di-fegatini.html">
+        <h3>🇮🇹 Crostini di Fegatini</h3>
+        <p>Toscaanse, licht korrelige kippenleverpaté voor op geroosterd brood.</p>
+        <span class="badge">Open recept</span>
+      </a>
+      <a class="recept" href="recepten/sticky-korean-honey-chili-saus.html">
+        <h3>🍯🌶️ Sticky Korean Honey Chili Saus</h3>
+        <p>Pittig-zoete sticky saus met honing, gochujang en sweet chilisaus.</p>
+        <span class="badge">Open recept</span>
+      </a>
+    </div>
+  </div>
+
   <script>
-    function addKoreanSauce(){
-      const frame=document.getElementById('buikboek-frame');
-      const doc=frame.contentDocument||frame.contentWindow.document;
-      if(!doc||doc.getElementById('sticky-korean-honey-chili-saus')) return;
-      const card=doc.createElement('article');
-      card.className='recipe-card';
-      card.id='sticky-korean-honey-chili-saus';
-      card.innerHTML=`
-        <div class="recipe-head">
-          <div class="emoji">🍯🌶️</div>
-          <div>
-            <h3>Sticky Korean Honey Chili Saus</h3>
-            <p>Pittig zoet • honingachtig • zonder koken</p>
-          </div>
-        </div>
-        <ul>
-          <li>3 el honing</li>
-          <li>1 el gochujang</li>
-          <li>1 el sweet chilisaus</li>
-          <li>1 tl sojasaus</li>
-          <li>1 tl rijstazijn of natuurazijn</li>
-          <li>Klein scheutje sesamolie, optioneel</li>
-          <li>Snufje MSG, optioneel</li>
-        </ul>
-        <div class="method"><b>Bereiding:</b> Alles koud mengen tot een gladde sticky saus. Over hete krokante kip doen of als dipsaus gebruiken. Meer honing = zoeter, meer gochujang = pittiger, meer azijn = frisser.</div>
-      `;
-      const sections=[...doc.querySelectorAll('.section')];
-      let sauceSection=sections.find(s=>/saus|sauzen/i.test((s.querySelector('h2')?.textContent||'')));
-      if(!sauceSection){
-        sauceSection=doc.createElement('section');
-        sauceSection.className='section gold';
-        sauceSection.id='sauzen';
-        sauceSection.innerHTML='<h2>SAUZEN</h2><div class="grid"></div>';
-        const footer=doc.querySelector('.footer');
-        if(footer) footer.before(sauceSection); else doc.body.appendChild(sauceSection);
-      }
-      let grid=sauceSection.querySelector('.grid');
-      if(!grid){grid=doc.createElement('div');grid.className='grid';sauceSection.appendChild(grid)}
-      grid.appendChild(card);
-    }
-    document.getElementById('buikboek-frame').addEventListener('load',()=>setTimeout(addKoreanSauce,300));
+    const paneel=document.getElementById('nieuw-paneel');
+    document.getElementById('nieuw-knop').addEventListener('click',()=>{paneel.classList.add('open');paneel.setAttribute('aria-hidden','false')});
+    document.getElementById('sluit-paneel').addEventListener('click',()=>{paneel.classList.remove('open');paneel.setAttribute('aria-hidden','true')});
+    paneel.addEventListener('click',e=>{if(e.target===paneel){paneel.classList.remove('open');paneel.setAttribute('aria-hidden','true')}});
   </script>
 </body>
 </html>
