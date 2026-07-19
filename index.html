@@ -16,39 +16,91 @@
   <style>
     html,body{margin:0;width:100%;height:100%;background:#090806;overflow:hidden}
     iframe{position:fixed;inset:0;width:100%;height:100%;border:0;background:#090806}
-    #nieuw-knop{position:fixed;right:16px;bottom:18px;z-index:99999;border:1px solid #e5bd63;background:#17130e;color:#f5e3b6;border-radius:999px;padding:13px 17px;font:700 14px Arial,sans-serif;box-shadow:0 8px 28px #000a}
-    #nieuw-paneel{display:none;position:fixed;inset:0;z-index:100000;background:#000c;overflow:auto;padding:18px;box-sizing:border-box}
-    #nieuw-paneel.open{display:block}
-    .nieuw-wrap{max-width:760px;margin:24px auto;background:#0e0c09;border:1px solid #8f6b2d;border-radius:22px;padding:18px;box-shadow:0 20px 60px #000}
-    .nieuw-top{display:flex;align-items:center;justify-content:space-between;gap:12px}.nieuw-top h2{margin:0;color:#e5bd63;font:800 24px Arial,sans-serif}.sluit{border:0;background:#2a241b;color:#fff;border-radius:10px;padding:9px 12px;font-size:18px}
-    .recept{display:block;margin-top:14px;padding:17px;border:1px solid #5b4724;border-radius:16px;background:#17130e;color:#f5ead3;text-decoration:none;font-family:Arial,sans-serif}.recept h3{margin:0 0 7px;color:#f0d497;font-size:19px}.recept p{margin:0;color:#d5c7ab;line-height:1.45}.badge{display:inline-block;margin-top:10px;background:#e5bd63;color:#17130e;border-radius:999px;padding:7px 10px;font-weight:800;font-size:12px}
   </style>
 </head>
 <body>
-  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=nieuw-recepten-2" title="Buikboek"></iframe>
-
-  <button id="nieuw-knop" type="button">✨ Nieuwe recepten (2)</button>
-  <div id="nieuw-paneel" aria-hidden="true">
-    <div class="nieuw-wrap">
-      <div class="nieuw-top"><h2>Nieuw in je Buikboek</h2><button class="sluit" id="sluit-paneel" type="button">✕</button></div>
-      <a class="recept" href="recepten/crostini-di-fegatini.html">
-        <h3>🇮🇹 Crostini di Fegatini</h3>
-        <p>Toscaanse, licht korrelige kippenleverpaté voor op geroosterd brood.</p>
-        <span class="badge">Open recept</span>
-      </a>
-      <a class="recept" href="recepten/sticky-korean-honey-chili-saus.html">
-        <h3>🍯🌶️ Sticky Korean Honey Chili Saus</h3>
-        <p>Pittig-zoete sticky saus met honing, gochujang en sweet chilisaus.</p>
-        <span class="badge">Open recept</span>
-      </a>
-    </div>
-  </div>
-
+  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=definitief-3" title="Buikboek"></iframe>
   <script>
-    const paneel=document.getElementById('nieuw-paneel');
-    document.getElementById('nieuw-knop').addEventListener('click',()=>{paneel.classList.add('open');paneel.setAttribute('aria-hidden','false')});
-    document.getElementById('sluit-paneel').addEventListener('click',()=>{paneel.classList.remove('open');paneel.setAttribute('aria-hidden','true')});
-    paneel.addEventListener('click',e=>{if(e.target===paneel){paneel.classList.remove('open');paneel.setAttribute('aria-hidden','true')}});
+    function recipeCard(doc,id,emoji,title,subtitle,ingredients,method){
+      const card=doc.createElement('article');
+      card.className='recipe-card';
+      card.id=id;
+      card.innerHTML=`
+        <div class="recipe-head">
+          <div class="emoji">${emoji}</div>
+          <div><h3>${title}</h3><p>${subtitle}</p></div>
+        </div>
+        <ul>${ingredients.map(x=>`<li>${x}</li>`).join('')}</ul>
+        <div class="method"><b>Bereiding:</b> ${method}</div>`;
+      return card;
+    }
+
+    function findSection(doc,pattern){
+      return [...doc.querySelectorAll('.section, section')].find(section=>{
+        const heading=section.querySelector('h1,h2,h3');
+        return heading && pattern.test(heading.textContent.trim());
+      });
+    }
+
+    function ensureGrid(doc,section){
+      let grid=section.querySelector('.grid');
+      if(!grid){grid=doc.createElement('div');grid.className='grid';section.appendChild(grid)}
+      return grid;
+    }
+
+    function addRecipes(){
+      const frame=document.getElementById('buikboek-frame');
+      const doc=frame.contentDocument||frame.contentWindow.document;
+      if(!doc||!doc.body) return;
+
+      if(!doc.getElementById('sticky-korean-honey-chili-saus')){
+        let sauceSection=findSection(doc,/sausjes\s*&\s*dips|sauzen\s*&\s*dips|sausjes|sauzen/i);
+        if(!sauceSection){
+          sauceSection=doc.createElement('section');
+          sauceSection.className='section gold';
+          sauceSection.id='sausjes-en-dips';
+          sauceSection.innerHTML='<h2>SAUSJES & DIPS</h2><div class="grid"></div>';
+          const footer=doc.querySelector('.footer, footer');
+          if(footer) footer.before(sauceSection); else doc.body.appendChild(sauceSection);
+        }
+        ensureGrid(doc,sauceSection).appendChild(recipeCard(
+          doc,
+          'sticky-korean-honey-chili-saus',
+          '🍯🌶️',
+          'Sticky Korean Honey Chili Saus',
+          'Pittig zoet • honingachtig • zonder koken',
+          ['3 el honing','1 el gochujang','1 el sweet chilisaus','1 tl sojasaus','1 tl rijstazijn of natuurazijn','Klein scheutje sesamolie, optioneel','Snufje MSG, optioneel'],
+          'Meng alles koud tot een gladde, kleverige saus. Lekker over hete krokante kip of als dip. Meer honing maakt hem zoeter, meer gochujang pittiger en meer azijn frisser.'
+        ));
+      }
+
+      if(!doc.getElementById('crostini-di-fegatini')){
+        let sideSection=findSection(doc,/^bijgerechten$/i);
+        if(!sideSection){
+          sideSection=doc.createElement('section');
+          sideSection.className='section gold';
+          sideSection.id='bijgerechten';
+          sideSection.innerHTML='<h2>BIJGERECHTEN</h2><div class="grid"></div>';
+          const footer=doc.querySelector('.footer, footer');
+          if(footer) footer.before(sideSection); else doc.body.appendChild(sideSection);
+        }
+        ensureGrid(doc,sideSection).appendChild(recipeCard(
+          doc,
+          'crostini-di-fegatini',
+          '🇮🇹🍞',
+          'Crostini di Fegatini',
+          'Toscaanse kippenleverpaté • licht korrelig • voor op brood',
+          ['500 g kippenlevers','1 ui, fijngesneden','2 tenen knoflook, fijngehakt','3 el olijfolie','50 g boter','100 ml droge witte wijn','5–6 salieblaadjes','2 ansjovisfilets','1 el kappertjes','Zout en zwarte peper'],
+          'Bak de ui 8–10 minuten zacht in olijfolie. Voeg knoflook, salie, ansjovis en kappertjes toe. Bak de kippenlevers 4–5 minuten mee, blus af met witte wijn en laat bijna volledig inkoken. Voeg de boter toe en pulseer kort, zodat de paté bewust licht grof en korrelig blijft. Laat minimaal 2 uur koelen en serveer op geroosterd brood.'
+        ));
+      }
+    }
+
+    const frame=document.getElementById('buikboek-frame');
+    frame.addEventListener('load',()=>{
+      setTimeout(addRecipes,250);
+      setTimeout(addRecipes,1000);
+    });
   </script>
 </body>
 </html>
