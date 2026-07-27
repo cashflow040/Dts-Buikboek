@@ -19,7 +19,7 @@
   </style>
 </head>
 <body>
-  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=buikboek-203" title="Buikboek"></iframe>
+  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=buikboek-204" title="Buikboek"></iframe>
   <script>
     (function(){
       function makeCard(doc,id,emoji,title,subtitle,ingredients,method,imageSrc){
@@ -103,7 +103,11 @@
         if(!doc.getElementById('crostini-di-fegatini')){
           gridFor(doc,sides).appendChild(makeCard(doc,'crostini-di-fegatini','🇮🇹🍞','Crostini di Fegatini','Toscaanse kippenleverpaté • licht korrelig • voor op brood',['500 g kippenlevers','1 ui, fijgesneden','2 tenen knoflook, fijngehakt','3 el olijfolie','50 g boter','100 ml droge witte wijn','5–6 salieblaadjes','2 ansjovisfilets','1 el kappertjes','Zout en zwarte peper'],'Bak de ui 8–10 minuten zacht in olijfolie. Voeg knoflook, salie, ansjovis en kappertjes toe. Bak de kippenlevers 4–5 minuten mee, blus af met witte wijn en laat bijna volledig inkoken. Voeg de boter toe en pulseer kort, zodat de paté bewust licht grof en korrelig blijft. Laat minimaal 2 uur koelen en serveer op geroosterd brood.','https://image.pollinations.ai/prompt/rustic%20Italian%20crostini%20di%20fegatini%20Tuscan%20chicken%20liver%20pate%20on%20toasted%20baguette%20wooden%20board%20warm%20natural%20light%20realistic%20food%20photography%20no%20text?width=640&height=568&seed=18473&nologo=true'));
         }
-        return !!doc.getElementById('sticky-korean-honey-chili-saus') && !!doc.getElementById('crostini-di-fegatini');
+
+        if(!doc.getElementById('romige-bundelzwammen-bosui-ketjap')){
+          gridFor(doc,sides).appendChild(makeCard(doc,'romige-bundelzwammen-bosui-ketjap','🍄🌿','Romige Bundelzwammen met Bosui & Ketjap','Romig • hartig • licht zoetzuur • lekker met vers brood',['Bundelzwammen','Klontje roomboter','Beetje melk','Scheutje kookroom','Klein beetje sojasaus','Klein beetje ketjap manis','Paprikapoeder','Knoflookpoeder','Rozemarijn','Snufje MSG','Zwarte peper','Bosui, fijngesneden','Klein scheutje azijn','Zwarte sesamzaadjes','Vers brood van de bakker en roomboter, om erbij te serveren'],'Smelt een klontje boter op laag vuur en bak de bundelzwammen rustig. Voeg een beetje melk en een scheutje kookroom toe. Breng op smaak met sojasaus, ketjap, paprikapoeder, knoflookpoeder, rozemarijn, MSG en zwarte peper. Laat zachtjes indikken en schep het grootste gedeelte in een kom. Bak de bosui enkele minuten in de resten van de pan met een klein scheutje azijn. Verdeel dit over de romige bundelzwammen en werk af met zwarte sesamzaadjes. Serveer met vers bakkersbrood en roomboter.','https://image.pollinations.ai/prompt/creamy%20Asian%20fusion%20cluster%20mushrooms%20in%20a%20small%20rustic%20bowl%20topped%20with%20sauteed%20spring%20onion%20and%20black%20sesame%20seeds%20fresh%20artisan%20bread%20and%20butter%20beside%20it%20warm%20cozy%20restaurant%20lighting%20highly%20realistic%20food%20photography%20no%20text?width=640&height=568&seed=39172&nologo=true'));
+        }
+        return !!doc.getElementById('sticky-korean-honey-chili-saus') && !!doc.getElementById('crostini-di-fegatini') && !!doc.getElementById('romige-bundelzwammen-bosui-ketjap');
       }
 
       var tries=0;
