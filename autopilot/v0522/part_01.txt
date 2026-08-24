@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+# AUTOPILOT PAPER BOT v0.522
+# Paper trading only. Public Bitvavo market data; NO API key and NO real orders.
+# Optional: pip install websockets  -> realtime ticker stream. REST fallback remains active.
+#
+# v0.513 implemented backlog points 01-20.
+# v0.514 added backlog points 21-40, driven by overnight/live paper data:
+# 21 true 3x DAY confirmation; 22 confirmation spacing; 23 confirmation timeout/reset;
+# 24 score-stability check; 25 visible per-market CHK x/3; 26 persistent top-3 DAY;
+# 27 DAY data-coverage gate; 28 quote/candle freshness gate; 29 spread-shock guard;
+# 30 guarded quality-C exception; 31 execution-impact/slippage guard;
+# 32 regime+quality risk scaling; 33 DAY refill cooldown; 34 failed-entry backoff;
+# 35 premium second SWING slot; 36 SWING entry spacing; 37 SWING momentum-cluster guard;
+# 38 faster strong-candidate SWING rotation; 39 adaptive stale/giveback exits;
+# 40 expanded Airtable/onscreen health + confirmation telemetry + T74 shadow test.
+# v0.515 hotfix/research pass: persistent top-3 DAY, auditable PASS 3/3, multi-reason WAIT,
+# complete quote-health telemetry, periodic full top-of-book refresh, and multi-speed/volatility risk damping.
+# v0.516 timing/early-move pass, driven by paper telemetry: event-driven ticker + live 1m candle stream,
+# 24h DAY context, EARLY small-cap pre-breakout watch, faster 3x confirmation, fresher quote merge,
+# modestly higher paper risk, dynamic peak-capture exits, and exit-efficiency telemetry.
+# v0.520 large update, backlog points 41-60:
+# 41 websocket subscription acknowledgements; 42 quiet-market WS health separated from event freshness;
+# 43 live 5m candles; 44 REST candle gap-healing instead of constant full polling;
+# 45 lower API load with 10m/30m healing cadence; 46 DAY score-velocity tracking;
+# 47 one-check EARLY pre-arm without bypassing final eligibility; 48 confirmation-quality validation;
+# 49 EARLY live-participation guard; 50 late-pump/deceleration anti-chase guard;
+# 51 net-MFE aware SWING peak lock; 52 tiered 55/65/72% net-profit retention;
+# 53 SWING cost-recovery profit floor; 54 DAY net-MFE profit lock;
+# 55 live order-book reversal protection for profitable positions; 56 stronger rotation/churn protection;
+# 57 98+ premium fast second SWING slot; 58 post-SWING-close refill cooldown;
+# 59 EARLY 5m/15m/60m shadow tests; 60 exit-efficiency + WS/flow telemetry on dashboard/Airtable.
+# v0.521 research/expectancy pass, backlog points 61-80:
+# 61 separate SWING trend-vs-entry-timing score; 62 volatility-normalized multi-horizon momentum;
+# 63 cross-sectional crypto relative-strength ranking; 64 anti-extension / anti-chase SWING gate;
+# 65 controlled pullback/rebound timing; 66 liquidity/cost-efficiency filter;
+# 67 breadth-aware long-only regime gate; 68 smoother volatility-managed risk scaling;
+# 69 fast regime-deterioration exit; 70 no-progress/failure exit;
+# 71 score de-saturation so 99/100 is rarer; 72 stricter rank requirement for slot 2;
+# 73 churn/rotation quality gate; 74 legacy-vs-research SWING shadow A/B (4h/24h);
+# 75 expectancy/payoff telemetry; 76 compact cockpit UI; 77 visible BUY flash; 78 visible SELL flash;
+# 79 live entry->price/P&L per open position; 80 technical detail remains in Airtable/background.
+# v0.522 precision/protection pass, backlog points 81-100:
+# 81 two-check SWING entry confirmation; 82 stability reset; 83 net-opportunity gate; 84 cost multiple;
+# 85 A+ setup classifier; 86 A+ boost only in healthy BULL; 87 stronger CHOP/BEAR damping;
+# 88 loss-streak risk damping; 89 tighter net peak-lock; 90 faster risk-off; 91 faster no-progress exit;
+# 92 EARLY flow persistence; 93 EARLY fakeout guard; 94 data-health entry gate; 95 0.521-vs-0.522 shadow A/B;
+# 96 profit-factor/payoff telemetry; 97 sample-gated evaluation; 98 cleaner cockpit; 99 migration/self-checks; 100 cleanup.
+
+import asyncio
+import json
+import math
+import os
+import sqlite3
+import statistics
+import threading
+import time
+import urllib.parse
+import urllib.request
+from collections import defaultdict, deque
+from datetime import datetime, date
+
+BASE_URL = "https://api.bitvavo.com/v2"
+WS_URL = "wss://ws.bitvavo.com/v2/"
+DB_FILE = "autopilot_v051.db"
+VERSION = "0.522"
+
+# ---------------------------
+# ACCOUNT / MARKET SETTINGS
+# ---------------------------
+START_EUR = 200.0
+QUOTE_MODE = "AUTO"              # AUTO, EUR, USDC
+MAX_MARKETS = 90  # scan target: within requested 70-100 market range
+MIN_MARKETS = 12
+UNIVERSE_REFRESH_SECONDS = 600
+DAY_CANDLE_REFRESH_SECONDS = 600
+DAY_CANDLE_HISTORY_LIMIT = 360          # 6h of 1m context, continuously updated by WS candles
+DAY_CONTEXT_REFRESH_SECONDS = 1800      # REST healing only; live 5m WS maintains context
+DAY_CONTEXT_5M_LIMIT = 288              # 24 hours
+SWING_REFRESH_SECONDS = 600
+SWING_UNIVERSE_MARKETS = 45  # broader multi-timeframe scan without overloading the phone/API
+DASHBOARD_SECONDS = 1.0
+REST_TICKER_FALLBACK_SECONDS = 5.0
+# Even with a healthy WS stream, refresh the complete best-bid/ask universe periodically.
+# Bitvavo /ticker/book is a single low-weight request and prevents quiet markets from
+# disappearing from the ranking merely because they emitted no recent ticker event.
+FULL_TOPBOOK_REFRESH_SECONDS = 12.0
+HEALTH_QUOTE_FRESH_SECONDS = 20.0
+HEALTH_WS_FRESH_SECONDS = 30.0
+WS_STALE_GLOBAL_SECONDS = 60.0
+POSITION_BOOK_REFRESH_SECONDS = 15.0
+POSITION_BOOK_SELL_PRESSURE = -0.45
+POSITION_BOOK_EXIT_MIN_NET_PCT = 0.12
+POSITION_BOOK_SCORE_DROP = 8
+SIGNAL_LOG_SECONDS = 60
+
+# ---------------------------
+# AIRTABLE LIVE TELEMETRY
+# ---------------------------
+# The token is NEVER hard-coded. v0.512 reads it from:
+#   ~/.autopilot_airtable_token
+# Keep that file chmod 600.
+AIRTABLE_BASE_ID = "appWD4eUGla1ym6w9"
+AIRTABLE_SNAPSHOTS_TABLE = "tblWU3wSqHiMyPbei"
+AIRTABLE_TRADES_TABLE = "tblByQLUuBlVF5nyt"
+AIRTABLE_SIGNALS_TABLE = "tblTZM7P0EHLjZTc7"
+AIRTABLE_TOKEN_FILE = os.path.expanduser("~/.autopilot_airtable_token")
+TELEMETRY_SNAPSHOT_SECONDS = 600       # every 10 minutes
+TELEMETRY_SIGNAL_LIMIT = 12             # top current candidates per snapshot
+TELEMETRY_HTTP_TIMEOUT = 10
+
+MIN_24H_VOLUME_EUR = 100_000.0
+MIN_24H_VOLUME_USDC = 15_000.0
+MAX_UNIVERSE_SPREAD_PCT = 0.45
+MAX_ENTRY_SPREAD_PCT = 0.28
+ALLOW_QUALITY_C = False
+
+# ---------------------------
+# DAYTRADE RISK
+# ---------------------------
+MAX_DAY_POSITIONS = 3
+DAY_RISK_PER_TRADE_PCT = 0.75
+DAY_MAX_POSITION_PCT = 32.0
+DAY_MAX_EXPOSURE_PCT = 78.0
+DAY_MAX_TRADE_MINUTES = 60
+DAY_ENTRY_CONFIRMATIONS = 3
+DAY_BASE_ENTRY_SCORE = 78
+DAY_ROTATION_SCORE_GAP = 10
+DAY_ROTATION_EDGE_GAP_PCT = 0.35
+DAY_ROTATION_MIN_SCORE = 86
+DAY_PAIR_COOLDOWN_SECONDS = 180
+DAY_MIN_CONFIDENCE_PROXY = 78          # score proxy, NOT a calibrated win probability
+DAY_PULLBACK_M5_MIN = -0.18
+DAY_FAST60_MIN = -0.15
+DAY_VOLUME_FLOOR_BULL = 0.85
+DAY_VOLUME_FLOOR_CHOP = 0.90
+DAY_VOLUME_FLOOR_BEAR = 1.05
+DAY_BEAR_EXCEPTION_SCORE = 92
+DAY_BEAR_EXCEPTION_EDGE_PCT = 0.40
+DAY_CONFIRMATION_MIN_SECONDS = 3.0
+DAY_CONFIRMATION_TIMEOUT_SECONDS = 45.0
+DAY_CONFIRMATION_SCORE_DROP_RESET = 6
+DAY_CONFIRMATION_MIN_FULL_CHECKS = 2
+DAY_CONFIRMATION_AVG_BUFFER = 0.25
+DAY_PREARM_SCORE_MARGIN = 3
+DAY_PREARM_EARLY_SCORE = 80
+DAY_SCORE_SLOPE_MIN = -2.5
+DAY_LATE_FADE_FAST60_MIN = 0.65
+DAY_LATE_FADE_ACCEL_MAX = -0.12
+DAY_CHASE_FAST60_PCT = 1.40
+DAY_CHASE_EXTENSION_ATR = 2.20
+DAY_PEAK_LOCK_ARM_NET_PCT = 0.25
+DAY_PEAK_LOCK_KEEP_FRAC = 0.60
+DAY_PEAK_LOCK_MIN_AGE_MIN = 5.0
+DAY_GLOBAL_REFILL_COOLDOWN_SECONDS = 20
+DAY_ATTEMPT_BACKOFF_SECONDS = 20
+DAY_MIN_ANALYSIS_COVERAGE = 0.70
+DAY_MAX_QUOTE_AGE_SECONDS = 12.0
+DAY_MAX_CANDLE_AGE_SECONDS = 180.0
+DAY_SPREAD_SHOCK_MULT = 2.50
+DAY_SPREAD_SHOCK_FLOOR_PCT = 0.12
+DAY_MAX_ENTRY_IMPACT_PCT = 0.18
+DAY_QUALITY_C_EXCEPTION_SCORE = 92
+DAY_QUALITY_C_MAX_SPREAD_PCT = 0.12
+DAY_QUALITY_C_MIN_VOLUME = 1.35
+
+DAY_ATR_STOP_MULT = 1.30
+DAY_MIN_STOP_PCT = 0.50
+DAY_MAX_STOP_PCT = 1.80
+DAY_REWARD_R = 2.20
+DAY_BREAKEVEN_R = 1.00
+DAY_TRAIL_R = 1.45
+DAY_TRAIL_ATR_MULT = 1.00
+
+# ---------------------------
+# SWING / POSITION RISK
+# ---------------------------
+SWING_ENABLED = True
+MAX_SWING_POSITIONS = 2
+SWING_RISK_PER_TRADE_PCT = 0.48
+SWING_MAX_POSITION_PCT = 22.0
+SWING_MAX_EXPOSURE_PCT = 48.0
+SWING_BASE_ENTRY_SCORE = 84
+SWING_BEAR_EXCEPTION_SCORE = 94
+SWING_MAX_DAYS = 7
+SWING_ATR_STOP_MULT = 1.80
+SWING_MIN_STOP_PCT = 2.0
+SWING_MAX_STOP_PCT = 8.0
+SWING_REWARD_R = 2.80
+SWING_TRAIL_ATR_MULT = 1.20
+SWING_TRAIL_ARM_MFE_PCT = 4.0
+SWING_GIVEBACK_ARM_MFE_PCT = 0.0         # compatibility; v0.520 arms from NET MFE instead
+SWING_GIVEBACK_KEEP_PCT = 0.55
+SWING_GIVEBACK_MIN_MINUTES = 10
+SWING_PEAK_LOCK_ARM_NET_PCT = 0.25
+SWING_PEAK_LOCK_KEEP_FRAC = 0.60        # protect more of NET peak after costs
+SWING_PEAK_LOCK_MIN_NET_PCT = 0.12
+SWING_STRONG_PEAK_NET_PCT = 1.00
+SWING_STRONG_PEAK_KEEP_FRAC = 0.70
+SWING_RUNNER_PEAK_NET_PCT = 2.00
+SWING_RUNNER_PEAK_KEEP_FRAC = 0.78
+SWING_WEAK_EXIT_SCORE = 70
+SWING_WEAK_EXIT_MIN_HOURS = 2.0
+SWING_STALE_HOURS = 12.0
+SWING_STALE_MIN_PROGRESS_PCT = 0.60
+SWING_ROTATION_MIN_SCORE = 92
+SWING_ROTATION_SCORE_GAP = 8
+SWING_ROTATION_MIN_AGE_MIN = 45
+SWING_PAIR_COOLDOWN_SECONDS = 900
+SWING_SLOT2_MIN_SCORE = 92
+SWING_SLOT2_BEAR_SCORE = 97
+SWING_ENTRY_GAP_SECONDS = 600
+SWING_FAST_SLOT2_SCORE = 98
+SWING_FAST_ENTRY_GAP_SECONDS = 180
+SWING_REFILL_COOLDOWN_SECONDS = 60
+SWING_ROTATION_PROTECT_NET_PEAK_PCT = 0.15
+SWING_ROTATION_PROTECT_SCORE = 82
+SWING_MAX_ENTRY_IMPACT_PCT = 0.35
+SWING_EARLY_STALE_HOURS = 6.0
+SWING_EARLY_STALE_MFE_PCT = 0.35
+SWING_EARLY_STALE_MAX_MOVE_PCT = 0.10
+
+# Research-driven SWING entry-quality layer. Evidence supports the architecture;
+# exact thresholds are deliberately PAPER-tested via shadow A/B before any live-money use.
+SWING_MIN_TIMING_SCORE = 62
+SWING_CHOP_MIN_TIMING_SCORE = 70
+SWING_BEAR_MIN_TIMING_SCORE = 82
+SWING_MIN_REL_STRENGTH_PCT = 55.0
+SWING_CHOP_MIN_REL_STRENGTH_PCT = 62.0
+SWING_BEAR_MIN_REL_STRENGTH_PCT = 78.0
+SWING_SLOT2_MIN_REL_STRENGTH_PCT = 72.0
+SWING_MAX_EXTENSION_ATR = 2.20
+SWING_HARD_EXTENSION_ATR = 3.00
+SWING_MIN_COST_EFFICIENCY = 7.0       # ATR / estimated round-trip cost
+SWING_CHOP_BREADTH_FLOOR = 0.30
+SWING_FAILURE_MINUTES = 25.0
+SWING_FAILURE_MAX_MFE_PCT = 0.15
+SWING_FAILURE_LOSS_PCT = 0.45
+SWING_FAILURE_TIMING_DROP = 12.0
+SWING_REGIME_BREAK_MINUTES = 20.0
+SWING_REGIME_BREADTH_DROP = 0.18
+SWING_REGIME_MAX_NET_PEAK_PCT = 0.20
+SWING_FAST_RISKOFF_MINUTES = 8.0
+SWING_FAST_RISKOFF_BREADTH_MAX = 0.30
+SWING_FAST_RISKOFF_BREADTH_DROP = 0.12
+SWING_FAST_RISKOFF_LOSS_PCT = 0.25
+SWING_VOL_TARGET_ATR_PCT = 4.0
+SWING_SHADOW_4H_SECONDS = 4 * 3600
+SWING_SHADOW_24H_SECONDS = 24 * 3600
+SWING_ENTRY_CONFIRMATIONS = 2
+SWING_CONFIRMATION_MIN_SECONDS = 4.0
+SWING_CONFIRMATION_TIMEOUT_SECONDS = 60.0
+SWING_CONFIRMATION_SCORE_DROP_RESET = 6.0
+SWING_CONFIRMATION_TIMING_DROP_RESET = 8.0
+SWING_MIN_NET_OPPORTUNITY_PCT = 0.45
+SWING_MIN_OPPORTUNITY_COST_MULT = 2.50
+SWING_A_PLUS_SCORE = 94
+SWING_A_PLUS_TIMING = 84
+SWING_A_PLUS_RANK = 85
+SWING_A_PLUS_COST_EFF = 10.0
+SWING_A_PLUS_BREADTH = 0.55
+SWING_A_PLUS_RISK_BOOST = 1.08
+ENTRY_MIN_QUOTE_COVERAGE = 0.70
+
+# ---------------------------
+# PORTFOLIO PROTECTIONS
+# ---------------------------
+MAX_TOTAL_EXPOSURE_PCT = 90.0
+MAX_OPEN_RISK_PCT = 2.60
+DAILY_LOSS_LIMIT_PCT = 3.0
+HARD_DRAWDOWN_PCT = 10.0
+LOSS_STREAK_COOLDOWN = 3
+LOSS_STREAK_COOLDOWN_MINUTES = 60
+
+# Recovery/profit lock: protect a recovery after the account dipped.
+RECOVERY_ARM_DRAWDOWN_PCT = 0.25
+RECOVERY_TRIGGER_PROFIT_PCT = 0.15
+RECOVERY_FLOOR_PROFIT_PCT = 0.05
+RECOVERY_HYSTERESIS_PCT = 0.08
+
+# ---------------------------
+# EXECUTION / COSTS
+# ---------------------------
+SLIPPAGE_SAFETY_PCT = 0.03
+MIN_NET_EDGE_PCT = 0.18
+ORDERBOOK_DEPTH = 25
+MIN_ORDERBOOK_IMBALANCE = -0.25
+
+# EARLY small-cap pre-breakout layer. It does not bypass DAY 3x confirmation.
+EARLY_STREAM_MARKETS = 30
+EARLY_MAX_24H_VOLUME = 8_000_000.0
+EARLY_MAX_24H_MOVE_PCT = 14.0
+EARLY_MAX_SPREAD_PCT = 0.18
+EARLY_WATCH_SCORE = 68
+EARLY_BUILD_SCORE = 80
+EARLY_ENTRY_QUALITY_C_SCORE = 88
+EARLY_MIN_FLOW_ACCEL = 1.35
+EARLY_MIN_BUY_PRESSURE = 0.08
+EARLY_MIN_VOL_RATIO = 1.15
+EARLY_MIN_TRADES_60S = 5
+EARLY_MIN_FLOW_PARTICIPATION = 0.15
+EARLY_MAX_FAST60_PCT = 2.20
+EARLY_RISK_SCALE = 0.72                # small coins stay smaller even though global paper risk is higher
+EARLY_PERSISTENCE_WINDOW_SECONDS = 10.0
+EARLY_PERSISTENCE_MIN_SAMPLES = 3
+EARLY_PERSISTENCE_MIN_PASS = 2
+EARLY_PERSIST_FLOW_ACCEL = 1.15
+EARLY_PERSIST_BUY_PRESSURE = 0.03
+EARLY_FAKEOUT_FAST60_MIN = 0.70
+EARLY_FAKEOUT_FLOW_ACCEL_MAX = 0.95
+EARLY_FAKEOUT_BUY_PRESSURE_MAX = -0.03
+
+# Lowest-volume public fee tier assumptions from current Bitvavo schedule.
+FEE_TAKER_BY_CATEGORY = {
+    "A": 0.0025,   # EUR crypto markets
+    "B": 0.0005,   # USDC crypto markets
+    "C": 0.0010,   # stablecoin pairs
+}
+
+STABLE_BASES = {
+    "USDC", "USDT", "EURC", "EUROP", "EURCV", "USDCV", "DAI"
+}
+
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": f"AutopilotPaperBot/{VERSION}"
+}
+
+try:
+    import websockets  # type: ignore
+    WEBSOCKETS_AVAILABLE = True
+except Exception:
+    websockets = None
+    WEBSOCKETS_AVAILABLE = False
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def http_get(path, params=None, timeout=12):
+    url = BASE_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def pct_change(new, old):
+    if old == 0:
+        return 0.0
+    return ((new - old) / old) * 100.0
+
+
+def ema(values, period):
+    if not values:
+        return 0.0
+    k = 2.0 / (period + 1.0)
+    out = values[0]
+    for x in values[1:]:
+        out = x * k + out * (1.0 - k)
+    return out
+
+
+def atr_pct(candles, period=14):
