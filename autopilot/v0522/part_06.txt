@@ -1,0 +1,355 @@
+        "score_pre_rank": float(pre_rank_score),
+        "score": int(round(pre_rank_score)),
+        "legacy_score": legacy_score,
+        "trend_score": float(trend_score),
+        "timing_score": float(timing_score),
+        "relative_momentum_raw": float(relative_momentum_raw),
+        "trend_1h": a1["trend"],
+        "trend_4h": a4["trend"],
+        "trend_1d": ad["trend"],
+        "trend_1d_long": trend_1d_long,
+        "ret_1h": ret_1h,
+        "ret_4h": ret_4h,
+        "ret_6h": ret_6h,
+        "ret_24h": ret_24h,
+        "ret_7d": ret_7d,
+        "ret_30d": ret_30d,
+        "speed_consensus": speed_consensus,
+        "atr_pct": max(a4["atr"], 1.0),
+        "atr_1h_pct": a1["atr"],
+        "atr_1d_pct": ad["atr"],
+        "extension_1h_atr": ext1,
+        "extension_4h_atr": ext4,
+        "rebound": rebound,
+        "controlled_pullback": controlled_pullback,
+        "acceleration": acceleration,
+    }
+
+
+def combine_swing_with_book(market, row, regime, breadth=0.5):
+    sa = swing_analysis_cache.get(market)
+    if not sa:
+        return None
+    bid, ask = ticker_bid_ask(row)
+    if bid <= 0 or ask <= bid:
+        return None
+    spr = ((ask - bid) / ((ask + bid) / 2)) * 100.0
+    q = quality_tier(market, ticker_24h.get(market, {}))
+    ladj = learning_adjustment(market, regime, "SWING_TREND", "SWING")
+    score = sa["score_pre_rank"] + ladj
+    legacy = float(sa.get("legacy_score", 50)) + ladj
+    if regime == "PANIC":
+        score -= 20
+        legacy -= 20
+    elif regime == "BEAR":
+        score -= 10
+        legacy -= 10
+    score -= clamp((spr / MAX_ENTRY_SPREAD_PCT) * 4, 0, 8)
+    legacy -= clamp((spr / MAX_ENTRY_SPREAD_PCT) * 4, 0, 8)
+    score = float(clamp(score, 0, 97))
+    legacy = int(clamp(round(legacy), 0, 100))
+    meta = markets_meta.get(market, {})
+    cost = expected_cost_pct(meta, spr)
+    stop_pct = clamp(sa["atr_pct"] * SWING_ATR_STOP_MULT, SWING_MIN_STOP_PCT, SWING_MAX_STOP_PCT)
+    target_pct = max(stop_pct * SWING_REWARD_R, cost + 0.40)
+    cost_efficiency = sa["atr_pct"] / max(cost, 0.01)
+    opportunity_gross_pct = min(target_pct, max(0.0, sa["atr_pct"] * 0.75))
+    net_opportunity_pct = max(0.0, opportunity_gross_pct - cost)
+    opportunity_cost_multiple = opportunity_gross_pct / max(cost, 0.01)
+    vol24 = safe_float(ticker_24h.get(market, {}).get("volumeQuote"), 0.0)
+    return {
+        **sa, "bid": bid, "ask": ask, "spread_pct": spr,
+        "quality": q, "regime": regime, "breadth": breadth, "setup_type": "SWING_RESEARCH",
+        "learning_adj": ladj, "score": int(round(score)), "score_pre_rank_live": score,
+        "legacy_score_final": legacy,
+        "expected_edge_pct": max(0.0, target_pct - cost),
+        "estimated_cost_pct": cost,
+        "cost_efficiency": cost_efficiency,
+        "opportunity_gross_pct": opportunity_gross_pct,
+        "net_opportunity_pct": net_opportunity_pct,
+        "opportunity_cost_multiple": opportunity_cost_multiple,
+        "volume_quote_24h": vol24,
+        "relative_strength_pct": 50.0,
+        "vol_ratio": 1.0,
+    }
+
+
+def enrich_swing_cross_section(rows):
+    """Add cross-sectional relative strength and final research score.
+
+    Crypto research finds cross-sectional momentum matters; ranking avoids the old failure mode
+    where many different coins simultaneously showed 99/100.
+    """
+    if not rows:
+        return rows
+    ordered = sorted(rows, key=lambda x: x.get("relative_momentum_raw", 0.0))
+    n = len(ordered)
+    ranks = {}
+    for i, a in enumerate(ordered):
+        ranks[a["market"]] = 100.0 if n == 1 else 100.0 * i / (n - 1)
+    for a in rows:
+        rank = ranks.get(a["market"], 50.0)
+        a["relative_strength_pct"] = rank
+        rank_adj = clamp((rank - 50.0) * 0.16, -8.0, 8.0)
+        score = safe_float(a.get("score_pre_rank_live"), a.get("score", 50)) + rank_adj
+        ext = max(a.get("extension_1h_atr", 0.0), a.get("extension_4h_atr", 0.0))
+        if ext > SWING_MAX_EXTENSION_ATR:
+            score -= clamp((ext - SWING_MAX_EXTENSION_ATR) * 8.0, 2.0, 12.0)
+        if a.get("cost_efficiency", 0.0) < SWING_MIN_COST_EFFICIENCY:
+            score -= 6.0
+        cap = 100 if (a.get("timing_score", 0) >= 88 and rank >= 90) else 98
+        a["score"] = int(clamp(round(score), 0, cap))
+        a["a_plus"] = bool(
+            a.get("quality") == "A" and a.get("score", 0) >= SWING_A_PLUS_SCORE and
+            a.get("timing_score", 0) >= SWING_A_PLUS_TIMING and rank >= SWING_A_PLUS_RANK and
+            a.get("cost_efficiency", 0) >= SWING_A_PLUS_COST_EFF and
+            a.get("breadth", 0.0) >= SWING_A_PLUS_BREADTH and a.get("regime") == "BULL"
+        )
+        legacy_threshold = SWING_BEAR_EXCEPTION_SCORE if a.get("regime") == "BEAR" else SWING_BASE_ENTRY_SCORE
+        a["legacy_eligible"] = bool(
+            a.get("quality") != "C" and a.get("regime") != "PANIC" and
+            a.get("spread_pct", 99) <= MAX_ENTRY_SPREAD_PCT and
+            swing_timeframes_ok(a) and a.get("legacy_score_final", 0) >= legacy_threshold
+        )
+    return rows
+
+
+# ============================================================
+# PORTFOLIO / RISK / EXECUTION
+# ============================================================
+
+def positions(strategy=None):
+    ps = state.get("positions", [])
+    if strategy:
+        return [p for p in ps if p.get("strategy") == strategy]
+    return ps
+
+
+def position_market_set():
+    return {p["market"] for p in positions()}
+
+
+def available_cash():
+    return state.get("balance", 0.0)
+
+
+def estimate_position_exit_quote(pos, books):
+    row = books.get(pos["market"], {})
+    bid, ask = ticker_bid_ask(row)
+    if bid <= 0:
+        bid = pos["entry"]
+    gross = pos["amount_base"] * bid
+    return gross - gross * pos["fee_rate"]
+
+
+def equity_quote(books):
+    total = state.get("balance", 0.0)
+    for p in positions():
+        total += estimate_position_exit_quote(p, books)
+    return total
+
+
+def equity_eur(books):
+    return quote_value_eur(equity_quote(books), books)
+
+
+def total_exposure_quote():
+    return sum(p.get("position_quote", 0.0) for p in positions())
+
+
+def open_risk_quote():
+    return sum(
+        p.get("position_quote", 0.0) * (p.get("stop_pct", 0.0) + p.get("cost_pct", 0.0)) / 100.0
+        for p in positions()
+    )
+
+
+def reset_day_if_needed(eq_eur):
+    today = str(date.today())
+    if state.get("day") != today:
+        state["day"] = today
+        state["day_start_equity_eur"] = eq_eur
+        state["session_low_eur"] = eq_eur
+        state["loss_streak"] = 0
+        state["recovery_armed"] = False
+        state["recovery_floor_eur"] = None
+        save_state()
+
+
+def pair_in_cooldown(market):
+    until = state.get("pair_cooldowns", {}).get(market, 0.0)
+    return time.time() < until
+
+
+def can_open(strategy, eq_eur):
+    if state.get("hard_halt"):
+        return False, "HARD HALT"
+    if time.time() < state.get("cooldown_until", 0):
+        return False, "loss cooldown"
+    day_start = state.get("day_start_equity_eur", eq_eur)
+    if day_start > 0 and pct_change(eq_eur, day_start) <= -DAILY_LOSS_LIMIT_PCT:
+        return False, "daglimiet"
+    peak = state.get("peak_equity_eur", eq_eur)
+    if peak > 0 and pct_change(eq_eur, peak) <= -HARD_DRAWDOWN_PCT:
+        state["hard_halt"] = True
+        save_state()
+        return False, "drawdown halt"
+    if strategy == "DAY" and time.time() - state.get("last_day_close_ts", 0.0) < DAY_GLOBAL_REFILL_COOLDOWN_SECONDS:
+        return False, "day refill cooldown"
+    if strategy == "DAY" and len(positions("DAY")) >= MAX_DAY_POSITIONS:
+        return False, "day slots vol"
+    if strategy == "SWING" and len(positions("SWING")) >= MAX_SWING_POSITIONS:
+        return False, "swing slot vol"
+    if available_cash() <= 0:
+        return False, "geen cash"
+    return True, "OK"
+
+
+def setup_risk_scale(a, strategy):
+    scale = 1.0
+    regime = a.get("regime", "CHOP")
+    if regime == "CHOP":
+        scale *= 0.75
+    elif regime == "BEAR":
+        scale *= 0.50
+    elif regime == "PANIC":
+        scale *= 0.35
+    if a.get("quality") == "B":
+        scale *= 0.90
+    elif a.get("quality") == "C":
+        scale *= 0.70
+    if strategy == "SWING":
+        if len(positions("SWING")) >= 1:
+            scale *= 0.90
+        consensus = int(a.get("speed_consensus", 2))
+        if consensus >= 3:
+            scale *= 1.02
+        elif consensus <= 2:
+            scale *= 0.90
+        atrv = max(1.0, safe_float(a.get("atr_pct"), SWING_VOL_TARGET_ATR_PCT))
+        vol_scale = clamp((SWING_VOL_TARGET_ATR_PCT / atrv) ** 0.25, 0.72, 1.05)
+        scale *= vol_scale
+        timing = safe_float(a.get("timing_score"), 50.0)
+        rank = safe_float(a.get("relative_strength_pct"), 50.0)
+        if timing < 70:
+            scale *= 0.88
+        if rank < 65:
+            scale *= 0.90
+        if safe_float(a.get("breadth"), 0.5) < 0.40:
+            scale *= 0.82
+        if a.get("a_plus"):
+            scale *= SWING_A_PLUS_RISK_BOOST
+    elif strategy == "DAY":
+        if a.get("atr_pct", 0.0) >= 1.50:
+            scale *= 0.85
+        if a.get("setup_type") == "EARLY_BUILD":
+            scale *= EARLY_RISK_SCALE
+    streak = int(state.get("loss_streak", 0)) if state else 0
+    if streak >= 3:
+        scale *= 0.60
+    elif streak == 2:
+        scale *= 0.75
+    elif streak == 1:
+        scale *= 0.90
+    return clamp(scale, 0.25, 1.10)
+
+def confidence_risk_scale(score):
+    if score >= 94:
+        return 1.18
+    if score >= 88:
+        return 1.00
+    if score >= 82:
+        return 0.90
+    return 0.75
+
+
+def position_size_quote(strategy, stop_pct, cost_pct, eq_quote, score=80, extra_scale=1.0):
+    base_risk_pct = DAY_RISK_PER_TRADE_PCT if strategy == "DAY" else SWING_RISK_PER_TRADE_PCT
+    risk_pct = base_risk_pct * confidence_risk_scale(score) * clamp(extra_scale, 0.25, 1.25)
+    max_pos_pct = DAY_MAX_POSITION_PCT if strategy == "DAY" else SWING_MAX_POSITION_PCT
+    risk_budget = eq_quote * risk_pct / 100.0
+    worst_frac = (stop_pct + cost_pct) / 100.0
+    by_risk = risk_budget / worst_frac if worst_frac > 0 else 0.0
+    by_cap = eq_quote * max_pos_pct / 100.0
+    cash_cap = available_cash() / 1.005
+
+    current_exposure = total_exposure_quote()
+    portfolio_cap = max(0.0, eq_quote * MAX_TOTAL_EXPOSURE_PCT / 100.0 - current_exposure)
+    if strategy == "DAY":
+        day_exposure = sum(p["position_quote"] for p in positions("DAY"))
+        strategy_cap = max(0.0, eq_quote * DAY_MAX_EXPOSURE_PCT / 100.0 - day_exposure)
+    else:
+        swing_exposure = sum(p["position_quote"] for p in positions("SWING"))
+        strategy_cap = max(0.0, eq_quote * SWING_MAX_EXPOSURE_PCT / 100.0 - swing_exposure)
+
+    current_risk = open_risk_quote()
+    max_risk = eq_quote * MAX_OPEN_RISK_PCT / 100.0
+    extra_risk_cap = max(0.0, max_risk - current_risk)
+    by_total_risk = extra_risk_cap / worst_frac if worst_frac > 0 else 0.0
+
+    return max(0.0, min(by_risk, by_cap, cash_cap, portfolio_cap, strategy_cap, by_total_risk))
+
+
+def correlation_proxy_block(candidate_market):
+    ca = day_analysis_cache.get(candidate_market)
+    if not ca:
+        return False
+    for p in positions("DAY"):
+        other = day_analysis_cache.get(p["market"])
+        if not other:
+            continue
+        same_direction = ca["m5"] * other["m5"] > 0 and ca["m15"] * other["m15"] > 0
+        both_fast = abs(ca["m5"]) > 0.35 and abs(other["m5"]) > 0.35
+        if same_direction and both_fast and p["market"].split("-")[0] != "BTC":
+            return True
+    return False
+
+
+def swing_momentum_cluster_block(a):
+    if not positions("SWING"):
+        return False
+    for p in positions("SWING"):
+        other = swing_analysis_cache.get(p.get("market"), {})
+        if not other:
+            continue
+        if (
+            a.get("ret_4h", 0) > 4.0 and other.get("ret_4h", 0) > 4.0 and
+            a.get("ret_1h", 0) > 1.0 and other.get("ret_1h", 0) > 1.0
+        ):
+            return True
+    return False
+
+def swing_slot_allowed(a):
+    n = len(positions("SWING"))
+    if time.time() - state.get("last_swing_close_ts", 0.0) < SWING_REFILL_COOLDOWN_SECONDS:
+        return False, "refill cooldown"
+    if n == 0:
+        return True, "slot1"
+    if n >= MAX_SWING_POSITIONS:
+        return False, "slots vol"
+    since_last = time.time() - state.get("last_swing_open_ts", 0.0)
+    gap_needed = SWING_FAST_ENTRY_GAP_SECONDS if a.get("score", 0) >= SWING_FAST_SLOT2_SCORE else SWING_ENTRY_GAP_SECONDS
+    if since_last < gap_needed:
+        return False, f"swing spacing {int(gap_needed-since_last)}s"
+    needed = SWING_SLOT2_BEAR_SCORE if a.get("regime") == "BEAR" else SWING_SLOT2_MIN_SCORE
+    if a.get("score", 0) < needed:
+        return False, f"slot2 score<{needed}"
+    if a.get("relative_strength_pct", 0.0) < SWING_SLOT2_MIN_REL_STRENGTH_PCT:
+        return False, f"slot2 rank<{SWING_SLOT2_MIN_REL_STRENGTH_PCT:.0f}"
+    if swing_momentum_cluster_block(a):
+        return False, "momentum cluster"
+    return True, "slot2 premium"
+
+def open_paper_trade(a, strategy):
+    market = a["market"]
+    if market in position_market_set() or pair_in_cooldown(market):
+        return False, "market bezet/cooldown"
+    if time.time() < entry_attempt_cooldowns.get(market, 0.0):
+        return False, "entry backoff"
+    if strategy == "SWING":
+        allowed, why = swing_slot_allowed(a)
+        if not allowed:
+            return False, why
+
+    meta = markets_meta[market]
+    fee = fee_rate(meta)
