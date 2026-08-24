@@ -1,0 +1,158 @@
+                            subs = msg.get("subscriptions") or {}
+                            ticker_sub = set(subs.get("ticker") or [])
+                            trade_sub = set(subs.get("trades") or [])
+                            candles_sub = subs.get("candles") or {}
+                            with self.lock:
+                                if ticker_sub:
+                                    self.subscribed["ticker"] = ticker_sub
+                                if trade_sub:
+                                    self.subscribed["trades"] = trade_sub
+                                if isinstance(candles_sub, dict):
+                                    if candles_sub.get("1m") is not None:
+                                        self.subscribed["candles_1m"] = set(candles_sub.get("1m") or [])
+                                    if candles_sub.get("5m") is not None:
+                                        self.subscribed["candles_5m"] = set(candles_sub.get("5m") or [])
+                                self.last_subscription_ts = time.time()
+                            continue
+                        if ev == "ticker":
+                            market = msg.get("market")
+                            if not market:
+                                continue
+                            ts = time.time()
+                            row = {
+                                "market": market,
+                                "bid": msg.get("bestBid"),
+                                "ask": msg.get("bestAsk"),
+                                "bidSize": msg.get("bestBidSize"),
+                                "askSize": msg.get("bestAskSize"),
+                                "last": msg.get("lastPrice"),
+                                "ts": ts,
+                                "source": "WS",
+                            }
+                            with self.lock:
+                                self.data[market] = row
+                                self.market_last_event[market] = ts
+                                self.last_event_ts = ts
+                            bid, ask = ticker_bid_ask(row)
+                            if bid > 0 and ask > bid:
+                                try:
+                                    price_history[market].append((ts, (bid + ask) / 2.0))
+                                except Exception:
+                                    pass
+                        elif ev == "candles":
+                            market = msg.get("market")
+                            interval = str(msg.get("interval") or "1m")
+                            raw_c = msg.get("candle") or []
+                            c = raw_c[0] if raw_c and isinstance(raw_c[0], (list, tuple)) else raw_c
+                            if market and interval in ("1m", "5m") and isinstance(c, (list, tuple)) and len(c) >= 6:
+                                parsed = [int(c[0]), safe_float(c[1]), safe_float(c[2]), safe_float(c[3]), safe_float(c[4]), safe_float(c[5])]
+                                with self.lock:
+                                    self.candle_data[(market, interval)] = parsed
+                                    self.last_candle_event_ts = time.time()
+                                    self.last_event_ts = self.last_candle_event_ts
+                        elif ev == "trade":
+                            market = msg.get("market")
+                            if not market:
+                                continue
+                            px = safe_float(msg.get("price"))
+                            amount = safe_float(msg.get("amount"))
+                            qv = px * amount
+                            if qv <= 0:
+                                continue
+                            signed = qv if msg.get("side") == "buy" else -qv
+                            ts = safe_float(msg.get("timestamp"), time.time() * 1000.0) / 1000.0
+                            with self.lock:
+                                self.trade_flow[market].append((ts, signed, qv))
+                                self.last_event_ts = max(self.last_event_ts, ts)
+            except Exception as e:
+                store.event("WS_RECONNECT", str(e))
+            finally:
+                with self.lock:
+                    self.connected = False
+                    self.subscribed = {"ticker": set(), "candles_1m": set(), "candles_5m": set(), "trades": set()}
+            await asyncio.sleep(2)
+
+
+wsfeed = WSMarketFeed()
+
+
+# ============================================================
+# BITVAVO PUBLIC DATA
+# ============================================================
+
+def fetch_markets():
+    rows = http_get("/markets")
+    return {r["market"]: r for r in rows if r.get("status") == "trading"}
+
+
+def fetch_ticker_24h():
+    rows = http_get("/ticker/24h")
+    return {r["market"]: r for r in rows}
+
+
+def fetch_books_all():
+    rows = http_get("/ticker/book")
+    ts = time.time()
+    return {r["market"]: {**r, "ts": ts} for r in rows}
+
+
+def fetch_candles(market, interval="1m", limit=100):
+    rows = http_get(f"/{market}/candles", {"interval": interval, "limit": limit})
+    rows = list(reversed(rows))
+    out = []
+    for r in rows:
+        if len(r) >= 6:
+            out.append([
+                int(r[0]), safe_float(r[1]), safe_float(r[2]),
+                safe_float(r[3]), safe_float(r[4]), safe_float(r[5])
+            ])
+    return out
+
+
+def fetch_book_depth(market, depth=ORDERBOOK_DEPTH):
+    return http_get(f"/{market}/book", {"depth": depth})
+
+
+def fee_rate(meta):
+    return FEE_TAKER_BY_CATEGORY.get(str(meta.get("feeCategory", "A")), 0.0025)
+
+
+def book_imbalance(book, levels=10):
+    bids = book.get("bids", [])[:levels]
+    asks = book.get("asks", [])[:levels]
+    bid_value = sum(safe_float(p) * safe_float(a) for p, a in bids)
+    ask_value = sum(safe_float(p) * safe_float(a) for p, a in asks)
+    total = bid_value + ask_value
+    return (bid_value - ask_value) / total if total > 0 else 0.0
+
+
+def weighted_buy_from_book(book, quote_amount):
+    remaining = quote_amount
+    base_bought = 0.0
+    quote_used = 0.0
+    for level in book.get("asks", []):
+        price, amount = safe_float(level[0]), safe_float(level[1])
+        if price <= 0 or amount <= 0:
+            continue
+        level_quote = price * amount
+        take_quote = min(remaining, level_quote)
+        base_bought += take_quote / price
+        quote_used += take_quote
+        remaining -= take_quote
+        if remaining <= 1e-9:
+            break
+    if quote_used <= 0 or remaining > max(0.01, quote_amount * 0.001):
+        return None
+    return quote_used / base_bought, base_bought
+
+
+def weighted_sell_from_book(book, base_amount):
+    remaining = base_amount
+    quote_received = 0.0
+    base_sold = 0.0
+    for level in book.get("bids", []):
+        price, amount = safe_float(level[0]), safe_float(level[1])
+        if price <= 0 or amount <= 0:
+            continue
+        take_base = min(remaining, amount)
+        quote_received += take_base * price
