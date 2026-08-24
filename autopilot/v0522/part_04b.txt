@@ -1,0 +1,188 @@
+            p.setdefault("entry_breadth", safe_float(p.get("entry_context", {}).get("breadth"), 0.5))
+            p.setdefault("entry_timing_score", safe_float(p.get("entry_context", {}).get("timing_score"), 50.0))
+            p.setdefault("entry_relative_strength_pct", safe_float(p.get("entry_context", {}).get("relative_strength_pct"), 50.0))
+            if p.get("strategy") == "DAY":
+                if source_version == "0.514" and "entry_confirmations" not in p:
+                    p["entry_confirmations"] = 3
+                    p["entry_confirmation_passed"] = True
+                    p["entry_confirmation_source"] = "migrated-v0.514"
+                if p.get("entry_confirmation_passed") and "entry_confirmation_full_count" not in p:
+                    p["entry_confirmation_full_count"] = int(p.get("entry_confirmations") or 3)
+        store.set("state", state)
+    else:
+        start_quote = initial_quote_balance(quote, books)
+        state = new_state(quote, start_quote)
+        store.set("state", state)
+
+
+def save_state():
+    store.set("state", state)
+
+
+# ============================================================
+# MARKET ANALYSIS
+# ============================================================
+
+price_history = defaultdict(lambda: deque(maxlen=600))
+day_candle_cache = {}
+day_analysis_cache = {}
+day_context_cache = {}
+early_universe = []
+swing_cache = {}
+swing_analysis_cache = {}
+confirmations = defaultdict(int)  # compatibility counter; mirrored from day_confirmation_state
+day_confirmation_state = defaultdict(lambda: {
+    "count": 0, "full_count": 0, "first_ts": 0.0, "last_ts": 0.0,
+    "last_score": None, "last_reason": "", "scores": []
+})
+swing_confirmation_state = defaultdict(lambda: {
+    "count": 0, "first_ts": 0.0, "last_ts": 0.0, "last_score": None,
+    "last_timing": None, "scores": [], "timings": [], "last_reason": ""
+})
+early_flow_history = defaultdict(lambda: deque(maxlen=30))
+entry_attempt_cooldowns = defaultdict(float)
+spread_history = defaultdict(lambda: deque(maxlen=90))
+score_history = defaultdict(lambda: deque(maxlen=180))
+day_context_5m_cache = {}
+position_book_cache = {}
+runtime_health = {
+    "day_coverage": 0.0, "swing_coverage": 0.0, "data_errors": 0,
+    "day_candles": 0, "day_total": 0, "swing_candles": 0, "swing_total": 0,
+    "quote_live": 0, "quote_total": 0, "ws_live": 0, "ws_total": 0,
+    "ws_subscribed": 0, "ws_candle_1m_subscribed": 0, "ws_candle_5m_subscribed": 0,
+    "ws_trade_subscribed": 0, "ws_event_age_s": 999.0,
+}
+last_universe_refresh = 0.0
+last_day_refresh = 0.0
+last_day_context_refresh = 0.0
+last_swing_refresh = 0.0
+last_rest_ticker = 0.0
+last_signal_log = 0.0
+rest_books_cache = {}
+learning_cache = {}
+last_learning_refresh = 0.0
+last_top_day_display = []
+last_top_early_display = []
+last_top_swing_display = []
+ui_trade_events = deque(maxlen=4)
+
+
+def historical_mid(market, seconds_ago, now):
+    target = now - seconds_ago
+    for ts, price in reversed(price_history[market]):
+        if ts <= target:
+            return price
+    return None
+
+
+def historical_score(market, seconds_ago, now):
+    target = now - seconds_ago
+    for ts, score in reversed(score_history[market]):
+        if ts <= target:
+            return score
+    return None
+
+
+def day_candle_analysis(market):
+    candles = day_candle_cache.get(market, [])
+    if len(candles) < 35:
+        return None
+    closes = [c[4] for c in candles]
+    volumes = [c[5] for c in candles]
+    e9 = ema(closes[-50:], 9)
+    e21 = ema(closes[-60:], 21)
+    prev_e21 = ema(closes[-65:-5], 21) if len(closes) >= 65 else e21
+    m5 = pct_change(closes[-1], closes[-6])
+    m15 = pct_change(closes[-1], closes[-16])
+    recent_vol = sum(volumes[-5:]) / 5.0
+    normal = volumes[-25:-5]
+    normal_vol = sum(normal) / len(normal) if normal else recent_vol
+    vol_ratio = recent_vol / normal_vol if normal_vol > 0 else 1.0
+    atr = atr_pct(candles)
+    extension = pct_change(closes[-1], e9) if e9 else 0.0
+    trend_up = e9 > e21 and e21 >= prev_e21
+    candle_age_s = max(0.0, time.time() - (candles[-1][0] / 1000.0)) if candles[-1][0] else 999.0
+    recent = candles[-20:]
+    range_high20 = max((c[2] for c in recent), default=closes[-1])
+    range_low20 = min((c[3] for c in recent), default=closes[-1])
+    range20_pct = pct_change(range_high20, range_low20) if range_low20 > 0 else 999.0
+    compression_ratio = range20_pct / max(atr, 0.05)
+    return {
+        "m5": m5,
+        "m15": m15,
+        "vol_ratio": vol_ratio,
+        "atr_pct": atr,
+        "extension_pct": extension,
+        "trend_up": trend_up,
+        "ema9": e9,
+        "ema21": e21,
+        "candle_age_s": candle_age_s,
+        "range_high20": range_high20,
+        "range_low20": range_low20,
+        "range20_pct": range20_pct,
+        "compression_ratio": compression_ratio,
+    }
+
+
+
+def day_context_analysis(candles):
+    if len(candles) < 40:
+        return None
+    closes = [c[4] for c in candles]
+    e12 = ema(closes, 12)
+    e36 = ema(closes, 36)
+    e72 = ema(closes, 72) if len(closes) >= 72 else e36
+    ret30 = pct_change(closes[-1], closes[-7]) if len(closes) >= 7 else 0.0
+    ret2h = pct_change(closes[-1], closes[-25]) if len(closes) >= 25 else 0.0
+    ret6h = pct_change(closes[-1], closes[-73]) if len(closes) >= 73 else ret2h
+    ret24h = pct_change(closes[-1], closes[0]) if closes[0] else 0.0
+    trend = e12 > e36 and e36 >= e72
+    score = 50.0
+    score += 18 if trend else -10
+    score += clamp(ret2h / 2.0 * 10.0, -10.0, 10.0)
+    score += clamp(ret6h / 5.0 * 8.0, -8.0, 8.0)
+    # Strong but not already-parabolic context is preferred.
+    if ret6h > 10 or abs(ret24h) > 20:
+        score -= 10
+    return {
+        "context_trend": trend,
+        "context_score": clamp(score, 0.0, 100.0),
+        "ret30m": ret30,
+        "ret2h": ret2h,
+        "ret6h": ret6h,
+        "ret24h_ctx": ret24h,
+    }
+
+def setup_type(a):
+    if a.get("fast60", 0) > 0.25 and a.get("vol_ratio", 1) > 1.5:
+        return "BREAKOUT"
+    if a.get("trend_up") and -0.10 <= a.get("fast15", 0) <= 0.10 and a.get("m5", 0) > 0:
+        return "PULLBACK"
+    if a.get("m5", 0) > 0 and a.get("m15", 0) > 0:
+        return "MOMENTUM"
+    return "MIXED"
+
+
+def compute_regime():
+    btc = day_analysis_cache.get(f"BTC-{quote}")
+    if not btc:
+        return "UNKNOWN", 0.5
+    analyses = list(day_analysis_cache.values())
+    if not analyses:
+        return "UNKNOWN", 0.5
+    breadth = sum(1 for a in analyses if a.get("trend_up")) / len(analyses)
+    if btc["m5"] < -1.0 or (breadth < 0.18 and btc["m15"] < -1.2):
+        return "PANIC", breadth
+    if btc["trend_up"] and btc["m5"] >= -0.10 and breadth >= 0.58:
+        return "BULL", breadth
+    if (not btc["trend_up"]) and breadth <= 0.38:
+        return "BEAR", breadth
+    return "CHOP", breadth
+
+
+def refresh_learning_cache(force=False):
+    global learning_cache, last_learning_refresh
+    now = time.time()
+    if not force and now - last_learning_refresh < 300:
+        return
+    cache = {}
