@@ -1,0 +1,129 @@
+            "fldJ38crGahnr9if0": json.dumps(status, separators=(",", ":"))[:95000],
+        }
+
+    def _signal_records(self, payload):
+        out = []
+        nowstamp = int(payload["ts"])
+        selected = (
+            [("DAY", a) for a in payload["day_results"][:8]] +
+            [("SWING", a) for a in payload["swing_results"][:4]]
+        )[:TELEMETRY_SIGNAL_LIMIT]
+
+        for idx, (strategy, a) in enumerate(selected):
+            reason = entry_reject_reason(a, strategy)
+            eligible = reason == "eligible"
+            if strategy == "DAY":
+                momentum = a.get("m5", 0.0)
+            else:
+                momentum = a.get("ret_4h", 0.0)
+            context = {
+                k: a.get(k) for k in (
+                    "quality", "setup_type", "trend_score", "momentum_score",
+                    "volume_score", "execution_score", "regime_score",
+                    "learning_adj", "fast15", "fast60", "m5", "m15",
+                    "atr_pct", "extension_pct", "ret_1h", "ret_4h",
+                    "trend_1h", "trend_4h", "trend_1d", "quote_age_s",
+                    "candle_age_s", "spread_baseline_pct", "spread_shock",
+                    "context_score", "context_trend", "ret30m", "ret2h", "ret6h", "ret24h_ctx",
+                    "early_score", "early_candidate", "buy_pressure", "flow_accel", "trade_count_60s", "flow_participation",
+                    "score_slope_15s", "score_slope_60s", "price_accel", "distance_to_high20_pct",
+                    "timing_score", "relative_strength_pct", "relative_momentum_raw", "trend_score",
+                    "extension_1h_atr", "extension_4h_atr", "rebound", "controlled_pullback", "acceleration",
+                    "cost_efficiency", "estimated_cost_pct", "net_opportunity_pct", "opportunity_cost_multiple", "a_plus", "breadth", "ret_6h", "ret_24h", "ret_7d", "ret_30d",
+                    "legacy_score_final", "legacy_eligible"
+                )
+            }
+            if strategy == "DAY":
+                context["confirmations"] = day_confirmation_info(a["market"])[0]
+                context["confirmation_full_count"] = int(day_confirmation_state[a["market"]].get("full_count", 0))
+                context["confirmations_required"] = DAY_ENTRY_CONFIRMATIONS
+            out.append({
+                "fldzhfEFtfIMjIb15": f"sig-{nowstamp}-{strategy}-{idx}-{a['market']}",
+                "fldphucrwk293Dbvm": iso_with_offset(),
+                "fld9lAU7IPCTRHLaG": strategy,
+                "fldqDGF5PJyedsD6A": a["market"],
+                "fldp7Kz7i1a8KZB6s": float(a.get("score", 0)),
+                "fldilVI2nZHHm3KJC": bool(eligible),
+                "fldLoNjX6qao3LKN1": "" if eligible else reason,
+                "fldE4sIRQVGrw0uk0": float(a.get("spread_pct", 0)) / 100.0,
+                "fld68e4QtuatT6FI3": float(a.get("vol_ratio", 1.0)),
+                "fldBAQib2e1Plxifm": float(momentum) / 100.0,
+                "fldGCmOyDq1FvgQ5e": float(a.get("expected_edge_pct", 0)) / 100.0,
+                "fldIrsRIJn79EjAx9": a.get("regime", "?"),
+                "fld1bN0mgoolZ0dlY": json.dumps(context, separators=(",", ":"))[:95000],
+            })
+        return out
+
+    def _worker(self, payload):
+        try:
+            self._post_records(AIRTABLE_SNAPSHOTS_TABLE, [self._snapshot_record(payload)])
+            sigs = self._signal_records(payload)
+            if sigs:
+                self._post_records(AIRTABLE_SIGNALS_TABLE, sigs)
+            last_trade_id = int(store.get("airtable_last_trade_id", 0) or 0)
+            while True:
+                rows = self._trade_rows_after(last_trade_id, 100)
+                if not rows:
+                    break
+                records = [self._trade_record(r) for r in rows]
+                self._post_records(AIRTABLE_TRADES_TABLE, records)
+                last_trade_id = int(rows[-1][0])
+                store.set("airtable_last_trade_id", last_trade_id)
+                if len(rows) < 100:
+                    break
+            with self.lock:
+                self.last_ok_ts = time.time()
+                self.last_error = ""
+                self.sent_snapshots += 1
+            store.event("AIRTABLE_OK", f"snapshot synced; trades through {last_trade_id}")
+        except Exception as e:
+            with self.lock:
+                self.last_error = str(e)[:500]
+            store.event("AIRTABLE_ERROR", self.last_error)
+        finally:
+            with self.lock:
+                self.syncing = False
+
+    def maybe_sync(self, day_results, swing_results, books, regime, breadth):
+        if not self.token():
+            return
+        now = time.time()
+        with self.lock:
+            if self.syncing:
+                return
+            if self.last_snapshot_ts and now - self.last_snapshot_ts < TELEMETRY_SNAPSHOT_SECONDS:
+                return
+            self.last_snapshot_ts = now
+            self.syncing = True
+        payload = {
+            "ts": now,
+            "day_results": [dict(a) for a in day_results[:12]],
+            "swing_results": [dict(a) for a in swing_results[:8]],
+            "books": {k: dict(v) for k, v in books.items()},
+            "regime": regime,
+            "breadth": breadth,
+        }
+        threading.Thread(target=self._worker, args=(payload,), daemon=True).start()
+
+
+telemetry = AirtableTelemetry()
+
+
+def reset_swing_confirmation(market, reason="reset"):
+    st = swing_confirmation_state[market]
+    st.update({"count":0,"first_ts":0.0,"last_ts":0.0,"last_score":None,"last_timing":None,"scores":[],"timings":[],"last_reason":reason})
+
+def update_swing_confirmation(a, eligible, now=None):
+    now = time.time() if now is None else now
+    market = a["market"]
+    st = swing_confirmation_state[market]
+    if not eligible:
+        reset_swing_confirmation(market, entry_reject_reason(a, "SWING")); return 0
+    if st.get("count",0) and now - st.get("last_ts",0.0) > SWING_CONFIRMATION_TIMEOUT_SECONDS:
+        reset_swing_confirmation(market,"timeout"); st = swing_confirmation_state[market]
+    if st.get("last_score") is not None and a.get("score",0) < float(st["last_score"]) - SWING_CONFIRMATION_SCORE_DROP_RESET:
+        reset_swing_confirmation(market,"score drop"); st = swing_confirmation_state[market]
+    if st.get("last_timing") is not None and a.get("timing_score",0) < float(st["last_timing"]) - SWING_CONFIRMATION_TIMING_DROP_RESET:
+        reset_swing_confirmation(market,"timing drop"); st = swing_confirmation_state[market]
+    if st.get("count",0) == 0 or now - st.get("last_ts",0.0) >= SWING_CONFIRMATION_MIN_SECONDS:
+        if st.get("count",0) == 0: st["first_ts"] = now
