@@ -1,0 +1,304 @@
+    if strategy == "DAY":
+        stop_pct = clamp(a["atr_pct"] * DAY_ATR_STOP_MULT, DAY_MIN_STOP_PCT, DAY_MAX_STOP_PCT)
+        target_pct = max(stop_pct * DAY_REWARD_R, expected_cost_pct(meta, a["spread_pct"]) + MIN_NET_EDGE_PCT)
+    else:
+        stop_pct = clamp(a["atr_pct"] * SWING_ATR_STOP_MULT, SWING_MIN_STOP_PCT, SWING_MAX_STOP_PCT)
+        target_pct = max(stop_pct * SWING_REWARD_R, expected_cost_pct(meta, a["spread_pct"]) + 0.40)
+
+    cost_pct = expected_cost_pct(meta, a["spread_pct"])
+    eq_quote = equity_quote(current_books())
+    size_quote = position_size_quote(strategy, stop_pct, cost_pct, eq_quote, a.get('score', 80), setup_risk_scale(a, strategy))
+    min_order = safe_float(meta.get("minOrderInQuoteAsset"), 5.0)
+    if size_quote < max(min_order, 8.0):
+        return False, "positie te klein"
+
+    if strategy == "DAY" and correlation_proxy_block(market):
+        return False, "correlatiecluster"
+
+    book = fetch_book_depth(market, ORDERBOOK_DEPTH)
+    imbalance = book_imbalance(book)
+    min_imbalance = MIN_ORDERBOOK_IMBALANCE
+    if a.get("quality") == "A" and a.get("score", 0) >= 92:
+        min_imbalance = -0.35
+    elif a.get("score", 0) >= 86:
+        min_imbalance = -0.30
+    if imbalance < min_imbalance:
+        return False, "orderboek verkoopdruk"
+
+    top_bid = safe_float(book.get("bids", [[0]])[0][0]) if book.get("bids") else 0.0
+    top_ask = safe_float(book.get("asks", [[0]])[0][0]) if book.get("asks") else 0.0
+    if top_bid <= 0 or top_ask <= top_bid:
+        entry_attempt_cooldowns[market] = time.time() + DAY_ATTEMPT_BACKOFF_SECONDS
+        return False, "orderboek ongeldig"
+    live_book_spread = ((top_ask - top_bid) / ((top_ask + top_bid) / 2.0)) * 100.0
+    if live_book_spread > MAX_ENTRY_SPREAD_PCT * 1.20:
+        entry_attempt_cooldowns[market] = time.time() + DAY_ATTEMPT_BACKOFF_SECONDS
+        return False, "orderboek spread"
+
+    fill = weighted_buy_from_book(book, size_quote)
+    if not fill:
+        entry_attempt_cooldowns[market] = time.time() + DAY_ATTEMPT_BACKOFF_SECONDS
+        return False, "geen ask liquiditeit"
+
+    entry, amount_base = fill
+    impact_pct = max(0.0, pct_change(entry, a.get("ask", top_ask))) if a.get("ask", top_ask) else 0.0
+    max_impact = DAY_MAX_ENTRY_IMPACT_PCT if strategy == "DAY" else SWING_MAX_ENTRY_IMPACT_PCT
+    if impact_pct > max_impact:
+        entry_attempt_cooldowns[market] = time.time() + DAY_ATTEMPT_BACKOFF_SECONDS
+        return False, f"impact {impact_pct:.2f}%"
+    notional = entry * amount_base
+    entry_fee = notional * fee
+    total_cash = notional + entry_fee
+    if total_cash > state["balance"]:
+        return False, "cash mismatch"
+
+    confirmation_count = 0
+    confirmation_full_count = 0
+    confirmation_span_s = 0.0
+    if strategy == "DAY":
+        cst = day_confirmation_state[market]
+        confirmation_count = int(cst.get("count", 0))
+        confirmation_full_count = int(cst.get("full_count", 0))
+        first_ts = float(cst.get("first_ts", 0.0) or 0.0)
+        last_ts = float(cst.get("last_ts", 0.0) or 0.0)
+        if first_ts and last_ts >= first_ts:
+            confirmation_span_s = last_ts - first_ts
+
+    pos = {
+        "id": f"{int(time.time()*1000)}-{market}-{strategy}",
+        "strategy": strategy,
+        "market": market,
+        "quote": quote,
+        "opened_at": now_iso(),
+        "opened_ts": time.time(),
+        "entry": entry,
+        "entry_ref_ask": a.get("ask", entry),
+        "entry_slippage_pct": impact_pct,
+        "entry_book_spread_pct": live_book_spread,
+        "risk_scale": setup_risk_scale(a, strategy),
+        "amount_base": amount_base,
+        "position_quote": notional,
+        "entry_fee": entry_fee,
+        "fee_rate": fee,
+        "entry_score": a["score"],
+        "entry_confirmations": confirmation_count if strategy == "DAY" else None,
+        "entry_confirmation_passed": bool(strategy == "DAY" and confirmation_count >= DAY_ENTRY_CONFIRMATIONS and confirmation_full_count >= DAY_CONFIRMATION_MIN_FULL_CHECKS),
+        "entry_confirmation_full_count": confirmation_full_count if strategy == "DAY" else None,
+        "entry_confirmation_span_s": confirmation_span_s if strategy == "DAY" else None,
+        "entry_spread_pct": a["spread_pct"],
+        "stop_pct": stop_pct,
+        "target_pct": target_pct,
+        "cost_pct": cost_pct,
+        "highest_bid": entry,
+        "lowest_bid": entry,
+        "mfe_pct": 0.0,
+        "mae_pct": 0.0,
+        "breakeven_active": False,
+        "trail_active": False,
+        "profit_lock_net_pct": 0.0,
+        "regime": a.get("regime", "?"),
+        "entry_breadth": safe_float(a.get("breadth"), 0.5),
+        "entry_timing_score": safe_float(a.get("timing_score"), 50.0),
+        "entry_relative_strength_pct": safe_float(a.get("relative_strength_pct"), 50.0),
+        "setup_type": a.get("setup_type", "?"),
+        "quality": a.get("quality", "?"),
+        "hour": local_hour(),
+        "weekday": local_weekday(),
+        "entry_context": {
+            k: a.get(k) for k in (
+                "score", "trend_score", "momentum_score", "volume_score",
+                "execution_score", "regime_score", "learning_adj", "m5", "m15",
+                "fast15", "fast60", "vol_ratio", "atr_pct", "expected_edge_pct",
+                "context_score", "ret30m", "ret2h", "ret6h", "ret24h_ctx",
+                "early_score", "buy_pressure", "flow_accel", "flow_participation", "trade_count_60s",
+                "score_slope_15s", "score_slope_60s", "price_accel", "distance_to_high20_pct",
+                "ret_1h", "ret_4h", "ret_6h", "ret_24h", "ret_7d", "ret_30d", "trend_1h", "trend_4h", "trend_1d", "trend_1d_long", "speed_consensus",
+                "trend_score", "timing_score", "relative_strength_pct", "relative_momentum_raw", "extension_1h_atr", "extension_4h_atr",
+                "rebound", "controlled_pullback", "acceleration", "cost_efficiency", "estimated_cost_pct", "breadth", "legacy_score_final",
+                "net_opportunity_pct", "opportunity_cost_multiple", "a_plus", "early_persistence", "early_fakeout"
+            )
+        },
+    }
+    if strategy == "DAY":
+        pos["entry_context"]["confirmations"] = confirmation_count
+        pos["entry_context"]["confirmation_full_count"] = confirmation_full_count
+        pos["entry_context"]["confirmations_required"] = DAY_ENTRY_CONFIRMATIONS
+        pos["entry_context"]["confirmation_span_s"] = confirmation_span_s
+    else:
+        sst = swing_confirmation_state[market]
+        pos["entry_context"]["swing_confirmations"] = int(sst.get("count", 0))
+        pos["entry_context"]["swing_confirmations_required"] = SWING_ENTRY_CONFIRMATIONS
+        pos["entry_context"]["swing_confirmation_scores"] = list(sst.get("scores") or [])
+        pos["entry_context"]["swing_confirmation_timings"] = list(sst.get("timings") or [])
+    state["balance"] -= total_cash
+    state["positions"].append(pos)
+    if strategy == "SWING":
+        state["last_swing_open_ts"] = time.time()
+    save_state()
+    store.event("OPEN", f"{strategy} {market} score={a['score']} entry={entry:.8f} imb={imbalance:+.2f}")
+    ui_trade_events.appendleft({
+        "ts": time.time(), "side": "BUY", "strategy": strategy, "market": market,
+        "price": entry, "score": a.get("score", 0), "pnl_pct": None, "reason": "OPEN"
+    })
+    return True, "OPEN"
+
+
+def find_position(pid):
+    for p in positions():
+        if p.get("id") == pid:
+            return p
+    return None
+
+
+def close_paper_trade(pid, reason):
+    pos = find_position(pid)
+    if not pos:
+        return False
+    books_before = current_books()
+    row_before = books_before.get(pos["market"], {})
+    ref_bid, _ = ticker_bid_ask(row_before)
+    try:
+        book = fetch_book_depth(pos["market"], ORDERBOOK_DEPTH)
+        fill = weighted_sell_from_book(book, pos["amount_base"])
+        if not fill:
+            return False
+        exit_price, gross_quote = fill
+    except Exception:
+        books = current_books()
+        row = books.get(pos["market"], {})
+        bid, _ = ticker_bid_ask(row)
+        if bid <= 0:
+            return False
+        exit_price = bid * (1.0 - SLIPPAGE_SAFETY_PCT / 100.0)
+        gross_quote = pos["amount_base"] * exit_price
+
+    exit_fee = gross_quote * pos["fee_rate"]
+    net_quote = gross_quote - exit_fee
+    total_cost = pos["position_quote"] + pos["entry_fee"]
+    pnl = net_quote - total_cost
+    pnl_pct = (pnl / total_cost) * 100.0 if total_cost > 0 else 0.0
+    duration = time.time() - pos["opened_ts"]
+
+    exit_slippage_pct = max(0.0, pct_change(ref_bid, exit_price)) if ref_bid > 0 else 0.0
+    total_slippage_pct = float(pos.get("entry_slippage_pct", 0.0)) + exit_slippage_pct
+    raw_exit_move_pct = pct_change(exit_price, pos["entry"]) if pos.get("entry", 0) else 0.0
+    peak_move = max(0.0, float(pos.get("mfe_pct", 0.0)))
+    estimated_cost_pct = max(0.0, float(pos.get("cost_pct", 0.0)))
+    net_peak_pct = max(0.0, peak_move - estimated_cost_pct)
+    net_exit_pct_est = raw_exit_move_pct - estimated_cost_pct
+    peak_capture_ratio = (raw_exit_move_pct / peak_move) if peak_move > 0.05 else None
+    net_peak_capture_ratio = (max(0.0, net_exit_pct_est) / net_peak_pct) if net_peak_pct > 0.05 else None
+    missed_peak_pct = peak_move - raw_exit_move_pct
+
+    state["balance"] += net_quote
+    state["positions"] = [p for p in state["positions"] if p.get("id") != pid]
+    if pos.get("strategy") == "DAY":
+        state["last_day_close_ts"] = time.time()
+        reset_day_confirmation(pos.get("market", "?"), "closed")
+    elif pos.get("strategy") == "SWING":
+        state["last_swing_close_ts"] = time.time()
+    cooldown = DAY_PAIR_COOLDOWN_SECONDS if pos.get("strategy") == "DAY" else SWING_PAIR_COOLDOWN_SECONDS
+    state.setdefault("pair_cooldowns", {})[pos["market"]] = time.time() + cooldown
+    if pnl > 0:
+        state["loss_streak"] = 0
+    else:
+        state["loss_streak"] = state.get("loss_streak", 0) + 1
+        if state["loss_streak"] >= LOSS_STREAK_COOLDOWN:
+            state["cooldown_until"] = time.time() + LOSS_STREAK_COOLDOWN_MINUTES * 60
+
+    t = {
+        **pos,
+        "closed_at": now_iso(),
+        "exit": exit_price,
+        "exit_fee": exit_fee,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "reason": reason,
+        "duration_seconds": duration,
+        "context": {
+            **pos.get("entry_context", {}),
+            "entry_slippage_pct": float(pos.get("entry_slippage_pct", 0.0)),
+            "exit_slippage_pct": exit_slippage_pct,
+            "slippage_pct": total_slippage_pct,
+            "raw_exit_move_pct": raw_exit_move_pct,
+            "estimated_roundtrip_cost_pct": estimated_cost_pct,
+            "net_peak_pct": net_peak_pct,
+            "net_exit_pct_est": net_exit_pct_est,
+            "peak_capture_ratio": peak_capture_ratio,
+            "net_peak_capture_ratio": net_peak_capture_ratio,
+            "missed_peak_pct": missed_peak_pct,
+        },
+    }
+    store.trade(t)
+    save_state()
+    store.event("CLOSE", f"{pos['strategy']} {pos['market']} {reason} pnl={pnl:+.4f} {quote}")
+    ui_trade_events.appendleft({
+        "ts": time.time(), "side": "SELL", "strategy": pos.get("strategy"), "market": pos.get("market"),
+        "price": exit_price, "score": pos.get("entry_score", 0), "pnl_pct": pnl_pct, "pnl": pnl, "reason": reason
+    })
+    return True
+
+
+_last_books_snapshot = {}
+
+
+def current_books():
+    return _last_books_snapshot
+
+
+def update_position_extremes(pos, bid):
+    pos["highest_bid"] = max(pos.get("highest_bid", bid), bid)
+    pos["lowest_bid"] = min(pos.get("lowest_bid", bid), bid)
+    pos["mfe_pct"] = max(pos.get("mfe_pct", 0.0), pct_change(pos["highest_bid"], pos["entry"]))
+    pos["mae_pct"] = min(pos.get("mae_pct", 0.0), pct_change(pos["lowest_bid"], pos["entry"]))
+
+
+def position_net_move_pct(pos, gross_move_pct):
+    return gross_move_pct - max(0.0, float(pos.get("cost_pct", 0.0)))
+
+def position_net_peak_pct(pos):
+    return max(0.0, float(pos.get("mfe_pct", 0.0)) - max(0.0, float(pos.get("cost_pct", 0.0))))
+
+def position_book_imbalance(market, force=False):
+    now = time.time()
+    cached = position_book_cache.get(market)
+    if cached and not force and now - cached.get("ts", 0.0) < POSITION_BOOK_REFRESH_SECONDS:
+        return cached.get("imbalance")
+    try:
+        book = fetch_book_depth(market, min(ORDERBOOK_DEPTH, 20))
+        imb = book_imbalance(book)
+        position_book_cache[market] = {"ts": now, "imbalance": imb}
+        return imb
+    except Exception as e:
+        runtime_health["data_errors"] = int(runtime_health.get("data_errors", 0)) + 1
+        store.event("BOOK_ERR", f"{market}: {e}")
+        return cached.get("imbalance") if cached else None
+
+def manage_positions(day_by_market, swing_by_market, books):
+    for pos in list(positions()):
+        row = books.get(pos["market"], {})
+        bid, _ = ticker_bid_ask(row)
+        if bid <= 0:
+            continue
+        update_position_extremes(pos, bid)
+        move = pct_change(bid, pos["entry"])
+        strat = pos["strategy"]
+        a = day_by_market.get(pos["market"]) if strat == "DAY" else swing_by_market.get(pos["market"])
+
+        if move <= -pos["stop_pct"]:
+            close_paper_trade(pos["id"], "STOP")
+            continue
+
+        if strat == "DAY":
+            r_now = move / pos["stop_pct"] if pos["stop_pct"] else 0.0
+            if r_now >= DAY_BREAKEVEN_R:
+                pos["breakeven_active"] = True
+            if r_now >= DAY_TRAIL_R:
+                pos["trail_active"] = True
+
+            if move >= pos["target_pct"]:
+                close_paper_trade(pos["id"], "TARGET")
+                continue
+
+            age_min = (time.time() - pos["opened_ts"]) / 60.0
+            net_peak = position_net_peak_pct(pos)
