@@ -1,0 +1,141 @@
+        st["count"] = min(SWING_ENTRY_CONFIRMATIONS, int(st.get("count",0))+1)
+        st["last_ts"] = now; st["last_score"] = float(a.get("score",0)); st["last_timing"] = float(a.get("timing_score",0))
+        st["scores"] = (list(st.get("scores") or []) + [float(a.get("score",0))])[-SWING_ENTRY_CONFIRMATIONS:]
+        st["timings"] = (list(st.get("timings") or []) + [float(a.get("timing_score",0))])[-SWING_ENTRY_CONFIRMATIONS:]
+        store.event("SWING_CHECK", f"{market} {st['count']}/{SWING_ENTRY_CONFIRMATIONS} score={a.get('score',0)} timing={a.get('timing_score',0):.0f}")
+    return int(st.get("count",0))
+
+def swing_confirmation_quality_ok(a):
+    st = swing_confirmation_state[a["market"]]
+    scores = [safe_float(x) for x in st.get("scores",[])]
+    timings = [safe_float(x) for x in st.get("timings",[])]
+    if int(st.get("count",0)) < SWING_ENTRY_CONFIRMATIONS or len(scores) < SWING_ENTRY_CONFIRMATIONS or len(timings) < SWING_ENTRY_CONFIRMATIONS: return False
+    if scores[-1] < max(scores) - SWING_CONFIRMATION_SCORE_DROP_RESET: return False
+    if timings[-1] < max(timings) - SWING_CONFIRMATION_TIMING_DROP_RESET: return False
+    return swing_eligible(a)
+
+def try_entries(day_results, swing_results, eq_eur):
+    # DAY: a setup must remain eligible through three time-separated checks.
+    ok_day, _ = can_open("DAY", eq_eur)
+    if ok_day:
+        now = time.time()
+        tracked = {a["market"] for a in day_results[:12]}
+        # Expire old checks for candidates that disappeared from the leading set.
+        for market, st in list(day_confirmation_state.items()):
+            if st.get("count", 0) and (market not in tracked or now - st.get("last_ts", 0.0) > DAY_CONFIRMATION_TIMEOUT_SECONDS):
+                reset_day_confirmation(market, "expired")
+
+        for a in day_results[:12]:
+            market = a["market"]
+            if market in position_market_set() or pair_in_cooldown(market):
+                reset_day_confirmation(market, "occupied/cooldown")
+                continue
+            if time.time() < entry_attempt_cooldowns.get(market, 0.0):
+                continue
+            eligible = day_eligible(a)
+            prearm = (not eligible) and int(day_confirmation_state[market].get("count", 0)) == 0 and day_prearm_eligible(a)
+            count = update_day_confirmation(a, eligible, now, prearm=prearm)
+            if count < DAY_ENTRY_CONFIRMATIONS:
+                continue
+            # Final eligibility and confirmation quality are checked immediately before execution.
+            if not day_eligible(a):
+                # Keep a valid pre-arm alive rather than resetting on the same near-threshold state.
+                if prearm:
+                    continue
+                reset_day_confirmation(market, "final check failed")
+                continue
+            if not day_confirmation_quality_ok(a):
+                reset_day_confirmation(market, "confirmation quality")
+                continue
+            opened, reason = open_paper_trade(a, "DAY")
+            reset_day_confirmation(market, "opened" if opened else reason)
+            if not opened:
+                entry_attempt_cooldowns[market] = time.time() + DAY_ATTEMPT_BACKOFF_SECONDS
+                store.event("SKIP", f"DAY {market}: {reason}")
+            eq_eur = equity_eur(current_books())
+            ok_day, _ = can_open("DAY", eq_eur)
+            if not ok_day:
+                break
+
+    # SWING: slot 1 normal; slot 2 is premium and cannot be filled immediately.
+    if SWING_ENABLED:
+        ok_swing, _ = can_open("SWING", eq_eur)
+        if ok_swing:
+            now = time.time()
+            tracked = {a["market"] for a in swing_results[:12]}
+            for market, st in list(swing_confirmation_state.items()):
+                if st.get("count",0) and (market not in tracked or now - st.get("last_ts",0.0) > SWING_CONFIRMATION_TIMEOUT_SECONDS):
+                    reset_swing_confirmation(market,"expired")
+            for a in swing_results[:10]:
+                market = a["market"]
+                if market in position_market_set() or pair_in_cooldown(market):
+                    reset_swing_confirmation(market,"occupied/cooldown"); continue
+                if time.time() < entry_attempt_cooldowns.get(market,0.0): continue
+                eligible = swing_eligible(a)
+                if update_swing_confirmation(a, eligible, now) < SWING_ENTRY_CONFIRMATIONS: continue
+                if not swing_confirmation_quality_ok(a):
+                    reset_swing_confirmation(market,"confirmation quality"); continue
+                allowed, _ = swing_slot_allowed(a)
+                if not allowed: continue
+                opened, reason = open_paper_trade(a,"SWING")
+                reset_swing_confirmation(market,"opened" if opened else reason)
+                if not opened:
+                    entry_attempt_cooldowns[market] = time.time() + DAY_ATTEMPT_BACKOFF_SECONDS
+                    store.event("SKIP", f"SWING {market}: {reason}")
+                eq_eur = equity_eur(current_books())
+                ok_swing, _ = can_open("SWING", eq_eur)
+                if not ok_swing: break
+
+
+def xformat(v):
+    try:
+        return f"{float(v):.1f}x"
+    except Exception:
+        return "1.0x"
+
+
+# ============================================================
+# COMPACT COCKPIT DASHBOARD
+# ============================================================
+
+def _price_fmt(v):
+    v = safe_float(v, 0.0)
+    if v >= 1000:
+        return f"{v:,.2f}"
+    if v >= 1:
+        return f"{v:.4f}"
+    if v >= 0.01:
+        return f"{v:.6f}"
+    return f"{v:.8f}"
+
+
+def dashboard(day_results, swing_results, books, regime, breadth):
+    os.system("clear")
+    eq_q = equity_quote(books)
+    eq_e = equity_eur(books)
+    reset_day_if_needed(eq_e)
+    state["session_low_eur"] = min(state.get("session_low_eur", eq_e), eq_e)
+    if eq_e > state.get("peak_equity_eur", eq_e):
+        state["peak_equity_eur"] = eq_e
+        save_state()
+
+    day_pnl = pct_change(eq_e, state.get("day_start_equity_eur", eq_e))
+    risk = 100 * open_risk_quote() / max(eq_q, 1e-9)
+    perf = store.performance_report(limit=200)
+    risk_txt = "HALT" if state.get("hard_halt") else ("COOLDOWN" if time.time() < state.get("cooldown_until",0) else "OK")
+
+    print(f"AUTOPILOT v{VERSION} | PAPER | LIVE")
+    print(f"€{eq_e:.2f} | Vandaag {day_pnl:+.2f}% | {regime} {breadth:.0%} | Risk {risk_txt} {risk:.2f}%")
+    print("=" * 58)
+
+    print("OPEN POSITIES")
+    if not positions():
+        print("  Geen open positie")
+    for p in positions():
+        row = books.get(p["market"], {})
+        bid, _ = ticker_bid_ask(row)
+        live = bid if bid > 0 else p.get("entry", 0)
+        mv = pct_change(live, p.get("entry", live)) if live > 0 else 0.0
+        net = position_net_move_pct(p, mv)
+        lock = p.get("profit_lock_net_pct", 0.0)
+        print(f"  {p['strategy']:<5} {p['market']:<11} {_price_fmt(p['entry'])} -> {_price_fmt(live)}  {mv:+.2f}%")
