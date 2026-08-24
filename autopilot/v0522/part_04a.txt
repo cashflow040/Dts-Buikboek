@@ -1,0 +1,204 @@
+        base_sold += take_base
+        remaining -= take_base
+        if remaining <= 1e-12:
+            break
+    if base_sold <= 0 or remaining > max(1e-12, base_amount * 0.001):
+        return None
+    return quote_received / base_sold, quote_received
+
+
+# ============================================================
+# QUOTE / UNIVERSE / QUALITY
+# ============================================================
+
+def ticker_bid_ask(t):
+    bid = safe_float(t.get("bid"), safe_float(t.get("bestBid")))
+    ask = safe_float(t.get("ask"), safe_float(t.get("bestAsk")))
+    return bid, ask
+
+
+def market_spread_pct(t):
+    bid, ask = ticker_bid_ask(t)
+    if bid <= 0 or ask <= bid:
+        return 999.0
+    return ((ask - bid) / ((ask + bid) / 2.0)) * 100.0
+
+
+def quote_candidates(markets, ticker, q):
+    min_vol = MIN_24H_VOLUME_USDC if q == "USDC" else MIN_24H_VOLUME_EUR
+    rows = []
+    for m, meta in markets.items():
+        if meta.get("quote") != q or meta.get("base") in STABLE_BASES:
+            continue
+        t = ticker.get(m)
+        if not t:
+            continue
+        vol = safe_float(t.get("volumeQuote"))
+        spr = market_spread_pct(t)
+        if vol >= min_vol and spr <= MAX_UNIVERSE_SPREAD_PCT:
+            rows.append((m, vol, spr))
+    return rows
+
+
+def select_quote(markets, ticker):
+    if QUOTE_MODE in ("EUR", "USDC"):
+        return QUOTE_MODE
+
+    scores = {}
+    for q in ("EUR", "USDC"):
+        rows = quote_candidates(markets, ticker, q)
+        if len(rows) < MIN_MARKETS:
+            scores[q] = 999.0
+            continue
+        spreads = [x[2] for x in rows[:MAX_MARKETS]]
+        fee = 0.0005 if q == "USDC" else 0.0025
+        effective_roundtrip = median(spreads, 0.20) + fee * 2 * 100.0
+        depth_penalty = max(0, 20 - len(rows)) * 0.015
+        scores[q] = effective_roundtrip + depth_penalty
+
+    chosen = min(scores, key=scores.get)
+    if scores[chosen] >= 999:
+        chosen = "EUR"
+    store.event("QUOTE", f"quote={chosen} scoreEUR={scores.get('EUR')} scoreUSDC={scores.get('USDC')}")
+    return chosen
+
+
+def quality_tier(market, ticker_row):
+    vol = safe_float(ticker_row.get("volumeQuote"))
+    spr = market_spread_pct(ticker_row)
+    open24 = safe_float(ticker_row.get("open"))
+    last = safe_float(ticker_row.get("last"), safe_float(ticker_row.get("price")))
+    chg = abs(pct_change(last, open24)) if open24 > 0 and last > 0 else 0.0
+
+    if vol >= 5_000_000 and spr <= 0.10:
+        tier = "A"
+    elif vol >= 500_000 and spr <= 0.18:
+        tier = "B"
+    else:
+        tier = "C"
+
+    if chg >= 25 and tier == "A":
+        tier = "B"
+    elif chg >= 25 and tier == "B":
+        tier = "C"
+    return tier
+
+
+def quality_threshold(tier):
+    return {"A": DAY_BASE_ENTRY_SCORE, "B": DAY_BASE_ENTRY_SCORE + 2, "C": 92}.get(tier, 92)
+
+
+def build_universe(markets, ticker, q):
+    candidates = quote_candidates(markets, ticker, q)
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    chosen = [x[0] for x in candidates[:MAX_MARKETS]]
+    btc = f"BTC-{q}"
+    eth = f"ETH-{q}"
+    for m in (btc, eth):
+        if m in markets and m not in chosen:
+            chosen.insert(0, m)
+    return chosen[:MAX_MARKETS]
+
+
+def build_early_universe(active_universe, ticker):
+    """Smaller but still tradable names. Avoid already-exploded coins and unusable spreads."""
+    rows = []
+    for market in active_universe:
+        base = market.split("-")[0]
+        if base in ("BTC", "ETH"):
+            continue
+        t = ticker.get(market, {})
+        vol = safe_float(t.get("volumeQuote"))
+        spr = market_spread_pct(t)
+        op = safe_float(t.get("open"))
+        last = safe_float(t.get("last"), safe_float(t.get("price")))
+        move24 = abs(pct_change(last, op)) if op > 0 and last > 0 else 0.0
+        if vol < (MIN_24H_VOLUME_USDC if quote == "USDC" else MIN_24H_VOLUME_EUR):
+            continue
+        if vol > EARLY_MAX_24H_VOLUME or spr > EARLY_MAX_SPREAD_PCT or move24 > EARLY_MAX_24H_MOVE_PCT:
+            continue
+        # Prefer the lower-volume half while retaining enough liquidity for execution.
+        rows.append((market, vol, spr))
+    rows.sort(key=lambda x: (x[1], -x[2]))
+    # Skip the thinnest tail if we have plenty of names, then keep a diverse 30.
+    if len(rows) > EARLY_STREAM_MARKETS + 10:
+        rows = rows[5:]
+    return [x[0] for x in rows[:EARLY_STREAM_MARKETS]]
+
+
+# ============================================================
+# ACCOUNT DENOMINATION / STATE
+# ============================================================
+
+markets_meta = {}
+ticker_24h = {}
+universe = []
+quote = "EUR"
+quote_to_eur_bid = 1.0
+
+
+def initial_quote_balance(q, books):
+    if q == "EUR":
+        return START_EUR
+    row = books.get("USDC-EUR") or {}
+    bid, ask = ticker_bid_ask(row)
+    if ask <= 0:
+        # conservative emergency approximation for paper mode only
+        return START_EUR * 0.995
+    conversion_fee = FEE_TAKER_BY_CATEGORY["C"]
+    return (START_EUR / ask) * (1.0 - conversion_fee)
+
+
+def quote_value_eur(quote_amount, books):
+    if quote == "EUR":
+        return quote_amount
+    row = books.get("USDC-EUR") or {}
+    bid, ask = ticker_bid_ask(row)
+    rate = bid if bid > 0 else 0.995
+    conversion_fee = FEE_TAKER_BY_CATEGORY["C"]
+    return quote_amount * rate * (1.0 - conversion_fee)
+
+
+def new_state(q, start_quote):
+    return {
+        "version": VERSION,
+        "quote": q,
+        "start_eur": START_EUR,
+        "start_quote_balance": start_quote,
+        "balance": start_quote,
+        "positions": [],
+        "peak_equity_eur": START_EUR,
+        "day": str(date.today()),
+        "day_start_equity_eur": START_EUR,
+        "session_low_eur": START_EUR,
+        "loss_streak": 0,
+        "cooldown_until": 0.0,
+        "pair_cooldowns": {},
+        "hard_halt": False,
+        "recovery_armed": False,
+        "recovery_floor_eur": None,
+        "last_recovery_lock_ts": 0.0,
+        "last_day_close_ts": 0.0,
+        "last_swing_open_ts": 0.0,
+        "last_swing_close_ts": 0.0,
+    }
+
+
+state = None
+
+
+def load_or_create_state(books):
+    global state
+    saved = store.get("state")
+    if saved and saved.get("version") in ("0.511", "0.512", "0.5121", "0.5122", "0.513", "0.5131", "0.514", "0.515", "0.516", "0.520", "0.521", "0.522") and saved.get("quote") == quote:
+        source_version = saved.get("version")
+        state = saved
+        state["version"] = VERSION
+        state.setdefault("last_day_close_ts", 0.0)
+        state.setdefault("last_swing_close_ts", 0.0)
+        if "last_swing_open_ts" not in state:
+            swing_opened = [float(p.get("opened_ts", 0.0)) for p in state.get("positions", []) if p.get("strategy") == "SWING"]
+            state["last_swing_open_ts"] = max(swing_opened, default=0.0)
+        # Preserve confirmation proof and initialize new v0.520 position-management fields.
+        for p in state.get("positions", []):
+            p.setdefault("profit_lock_net_pct", 0.0)
