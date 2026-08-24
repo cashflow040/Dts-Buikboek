@@ -1,0 +1,293 @@
+            "market": store.grouped_expectancy("market", strategy, min_samples=8),
+            "hour": store.grouped_expectancy("hour", strategy, min_samples=12),
+            "weekday": store.grouped_expectancy("weekday", strategy, min_samples=20),
+            "regime": store.grouped_expectancy("regime", strategy, min_samples=12),
+            "setup_type": store.grouped_expectancy("setup_type", strategy, min_samples=12),
+        }
+    learning_cache = cache
+    last_learning_refresh = now
+
+
+def learning_adjustment(market, regime, setup, strategy="DAY"):
+    # Safe memory layer: only small score nudges after enough paper samples.
+    refresh_learning_cache()
+    data = learning_cache.get(strategy, {})
+    adj = 0.0
+    groups = [
+        ("market", market, 2.5),
+        ("hour", str(local_hour()), 2.0),
+        ("weekday", str(local_weekday()), 1.0),
+        ("regime", regime, 2.0),
+        ("setup_type", setup, 2.0),
+    ]
+    for field, key, weight in groups:
+        row = data.get(field, {}).get(str(key))
+        if not row:
+            continue
+        avg = row["avg_pct"]
+        adj += clamp(avg / 0.30, -1.0, 1.0) * weight
+    return clamp(adj, -6.0, 6.0)
+
+
+def expected_cost_pct(meta, spread_pct):
+    return fee_rate(meta) * 2.0 * 100.0 + spread_pct + SLIPPAGE_SAFETY_PCT
+
+
+def calculate_day_score(market, row, now, regime, breadth):
+    ca = day_analysis_cache.get(market)
+    if not ca:
+        return None
+    bid, ask = ticker_bid_ask(row)
+    if bid <= 0 or ask <= bid:
+        return None
+    mid = (bid + ask) / 2.0
+    spr = ((ask - bid) / mid) * 100.0
+    quote_ts = safe_float(row.get("ts"), 0.0)
+    quote_age_s = max(0.0, now - quote_ts) if quote_ts > 0 else 999.0
+    hist = spread_history[market]
+    spread_baseline = median(list(hist), spr) if hist else spr
+    spread_shock = bool(len(hist) >= 8 and spr > max(DAY_SPREAD_SHOCK_FLOOR_PCT, spread_baseline * DAY_SPREAD_SHOCK_MULT))
+    hist.append(spr)
+    p15 = historical_mid(market, 15, now)
+    p60 = historical_mid(market, 60, now)
+    fast15 = pct_change(mid, p15) if p15 else 0.0
+    fast60 = pct_change(mid, p60) if p60 else 0.0
+    if p60 is None:
+        candles = day_candle_cache.get(market, [])
+        if len(candles) >= 2:
+            fast60 = pct_change(mid, candles[-2][4])
+            fast15 = fast60 * 0.25
+    fast_ready = p60 is not None or len(day_candle_cache.get(market, [])) >= 2
+
+    trend_score = 72 if ca["trend_up"] else 28
+    momentum_raw = (ca["m5"] / 0.60) * 42 + (ca["m15"] / 1.50) * 28 + (fast60 / 0.35) * 18 + (fast15 / 0.12) * 12
+    momentum_score = clamp(50 + momentum_raw, 0, 100)
+    volume_score = clamp(45 + (ca["vol_ratio"] - 1.0) * 30, 0, 100)
+    execution_score = clamp(100 - (spr / MAX_ENTRY_SPREAD_PCT) * 70, 0, 100)
+    regime_score = {"BULL": 85, "CHOP": 55, "BEAR": 25, "PANIC": 5, "UNKNOWN": 45}.get(regime, 45)
+    ctx = day_context_cache.get(market) or {"context_trend": ca.get("trend_up", False), "context_score": 50.0, "ret30m": ca.get("m15", 0.0), "ret2h": 0.0, "ret6h": 0.0, "ret24h_ctx": 0.0}
+    context_score = safe_float(ctx.get("context_score"), 50.0)
+
+    base = (
+        trend_score * 0.20 +
+        momentum_score * 0.25 +
+        volume_score * 0.15 +
+        execution_score * 0.15 +
+        regime_score * 0.10 +
+        context_score * 0.15
+    )
+
+    extension_limit = max(0.35, ca["atr_pct"] * 1.50)
+    fomo_penalty = 0.0
+    if ca["extension_pct"] > extension_limit:
+        fomo_penalty += clamp((ca["extension_pct"] - extension_limit) * 12, 0, 16)
+    if fast60 > max(0.80, ca["atr_pct"] * 2.0):
+        fomo_penalty += 10
+    if ca["vol_ratio"] > 5.0 and fast60 > 0.8:
+        fomo_penalty += 8
+
+    t24 = ticker_24h.get(market, {})
+    quality = quality_tier(market, t24)
+    flow = wsfeed.flow_metrics(market, now)
+    t24_vol = safe_float(t24.get("volumeQuote"), 0.0)
+    expected_minute_quote = max(1.0, t24_vol / 1440.0)
+    flow_participation = flow["trade_quote_60s"] / expected_minute_quote
+    is_early_universe = market in early_universe
+    high20 = safe_float(ca.get("range_high20"), mid)
+    distance_to_high = pct_change(mid, high20) if high20 > 0 else 0.0
+    early_score = 0.0
+    early_candidate = False
+    if is_early_universe:
+        early_score = 46.0
+        early_score += clamp((flow["flow_accel"] - 1.0) * 14.0, -8.0, 22.0)
+        early_score += clamp(flow["buy_pressure"] * 28.0, -14.0, 20.0)
+        early_score += clamp((ca["vol_ratio"] - 1.0) * 12.0, -8.0, 18.0)
+        early_score += clamp((flow_participation - 0.20) * 16.0, -6.0, 12.0)
+        if flow["trade_count_60s"] < EARLY_MIN_TRADES_60S:
+            early_score -= 8.0
+        early_score += 10.0 if ctx.get("context_trend") else -4.0
+        if -0.60 <= distance_to_high <= 0.30:
+            early_score += 10.0
+        elif distance_to_high > 0.80:
+            early_score -= 12.0
+        if ca.get("compression_ratio", 99) <= 4.5:
+            early_score += 5.0
+        if fast60 > EARLY_MAX_FAST60_PCT or abs(ctx.get("ret24h_ctx", 0.0)) > EARLY_MAX_24H_MOVE_PCT:
+            early_score -= 18.0
+        if spr > EARLY_MAX_SPREAD_PCT:
+            early_score -= 15.0
+        early_score = clamp(early_score, 0.0, 100.0)
+        eh = early_flow_history[market]
+        eh.append((now, float(early_score), float(flow["flow_accel"]), float(flow["buy_pressure"]), float(flow_participation), int(flow["trade_count_60s"])))
+        while eh and now - eh[0][0] > EARLY_PERSISTENCE_WINDOW_SECONDS:
+            eh.popleft()
+        persist_samples = list(eh)
+        persist_pass = sum(1 for _, es, fa, bp, fp, tc in persist_samples
+                           if es >= EARLY_BUILD_SCORE - 4 and fa >= EARLY_PERSIST_FLOW_ACCEL
+                           and bp >= EARLY_PERSIST_BUY_PRESSURE and fp >= EARLY_MIN_FLOW_PARTICIPATION
+                           and tc >= max(3, EARLY_MIN_TRADES_60S - 2))
+        early_persistence = persist_pass / max(1, len(persist_samples))
+        early_fakeout = bool(fast60 >= EARLY_FAKEOUT_FAST60_MIN and
+                             flow["flow_accel"] <= EARLY_FAKEOUT_FLOW_ACCEL_MAX and
+                             flow["buy_pressure"] <= EARLY_FAKEOUT_BUY_PRESSURE_MAX)
+        if early_fakeout:
+            early_score = max(0.0, early_score - 18.0)
+        if early_score >= EARLY_BUILD_SCORE and (len(persist_samples) < EARLY_PERSISTENCE_MIN_SAMPLES or persist_pass < EARLY_PERSISTENCE_MIN_PASS):
+            early_score = min(early_score, EARLY_BUILD_SCORE - 1.0)
+        early_candidate = early_score >= EARLY_WATCH_SCORE
+    else:
+        early_persistence = 0.0
+        early_fakeout = False
+
+    base_setup = setup_type({**ca, "fast15": fast15, "fast60": fast60})
+    setup = "EARLY_BUILD" if early_score >= EARLY_BUILD_SCORE else base_setup
+    ladj = learning_adjustment(market, regime, setup, "DAY")
+    early_bonus = clamp((early_score - EARLY_WATCH_SCORE) * 0.30, 0.0, 10.0) if is_early_universe else 0.0
+    score = clamp(round(base - fomo_penalty + ladj + early_bonus), 0, 100)
+    prev15 = historical_score(market, 15, now)
+    prev60 = historical_score(market, 60, now)
+    score_slope_15s = float(score - prev15) if prev15 is not None else 0.0
+    score_slope_60s = float(score - prev60) if prev60 is not None else score_slope_15s
+    price_accel = fast15 - (fast60 * 0.25)
+    score_history[market].append((now, float(score)))
+
+    meta = markets_meta.get(market, {})
+    cost = expected_cost_pct(meta, spr)
+    stop_pct = clamp(ca["atr_pct"] * DAY_ATR_STOP_MULT, DAY_MIN_STOP_PCT, DAY_MAX_STOP_PCT)
+    target_pct = max(stop_pct * DAY_REWARD_R, cost + MIN_NET_EDGE_PCT)
+    expected_edge = max(0.0, target_pct - cost)
+
+    return {
+        "market": market, "bid": bid, "ask": ask, "mid": mid,
+        "spread_pct": spr, "spread_baseline_pct": spread_baseline, "spread_shock": spread_shock,
+        "quote_age_s": quote_age_s,
+        "fast15": fast15, "fast60": fast60, "fast_ready": fast_ready,
+        "score": int(score), "trend_score": trend_score,
+        "momentum_score": momentum_score, "volume_score": volume_score,
+        "execution_score": execution_score, "regime_score": regime_score,
+        "context_score": context_score, "context_trend": bool(ctx.get("context_trend")),
+        "ret30m": safe_float(ctx.get("ret30m")), "ret2h": safe_float(ctx.get("ret2h")),
+        "ret6h": safe_float(ctx.get("ret6h")), "ret24h_ctx": safe_float(ctx.get("ret24h_ctx")),
+        "learning_adj": ladj, "regime": regime, "breadth": breadth,
+        "quality": quality, "setup_type": setup,
+        "expected_edge_pct": expected_edge,
+        "early_score": int(round(early_score)), "early_candidate": early_candidate,
+        "buy_pressure": flow["buy_pressure"], "flow_accel": flow["flow_accel"],
+        "trade_quote_15s": flow["trade_quote_15s"], "trade_quote_60s": flow["trade_quote_60s"],
+        "trade_count_60s": flow["trade_count_60s"], "flow_participation": flow_participation,
+        "early_persistence": early_persistence, "early_fakeout": early_fakeout,
+        "score_slope_15s": score_slope_15s, "score_slope_60s": score_slope_60s,
+        "price_accel": price_accel, "distance_to_high20_pct": distance_to_high,
+        **ca,
+    }
+
+
+def swing_analysis_market(market):
+    """Research-oriented SWING analysis.
+
+    Separate structural trend from entry timing. Momentum is normalized by volatility so
+    a huge raw return in a very volatile coin does not automatically become score 100.
+    """
+    pack = swing_cache.get(market)
+    if not pack:
+        return None
+    c1h = pack.get("1h", [])
+    c4h = pack.get("4h", [])
+    c1d = pack.get("1d", [])
+    if len(c1h) < 48 or len(c4h) < 42 or len(c1d) < 90:
+        return None
+
+    def tf(candles, fast, slow):
+        closes = [c[4] for c in candles]
+        last = closes[-1]
+        ef = ema(closes, fast)
+        es = ema(closes, slow)
+        atrv = max(0.05, atr_pct(candles))
+        e20 = ema(closes, min(20, len(closes)))
+        prev = closes[-2] if len(closes) >= 2 else last
+        prev2 = closes[-3] if len(closes) >= 3 else prev
+        return {
+            "trend": ef > es,
+            "last": last,
+            "atr": atrv,
+            "ema_fast": ef,
+            "ema_slow": es,
+            "ema20": e20,
+            "one_bar": pct_change(last, prev),
+            "prev_bar": pct_change(prev, prev2),
+            "extension_atr": pct_change(last, e20) / atrv if e20 > 0 else 0.0,
+            "closes": closes,
+        }
+
+    a1 = tf(c1h, 12, 26)
+    a4 = tf(c4h, 9, 21)
+    ad = tf(c1d, 10, 30)
+    closes1 = a1["closes"]
+    closes4 = a4["closes"]
+    closesd = ad["closes"]
+
+    ret_1h = a1["one_bar"]
+    ret_6h = pct_change(closes1[-1], closes1[-7]) if len(closes1) >= 7 else 0.0
+    ret_24h = pct_change(closes1[-1], closes1[-25]) if len(closes1) >= 25 else ret_6h
+    ret_4h = a4["one_bar"]
+    ret_24h_4h = pct_change(closes4[-1], closes4[-7]) if len(closes4) >= 7 else ret_4h
+    ret_7d = pct_change(closesd[-1], closesd[-8]) if len(closesd) >= 8 else 0.0
+    ret_30d = pct_change(closesd[-1], closesd[-31]) if len(closesd) >= 31 else ret_7d
+
+    trend_1d_long = ema(closesd, 30) > ema(closesd, 90)
+    speed_consensus = int(a1["trend"]) + int(a4["trend"]) + int(ad["trend"])
+
+    n6 = ret_6h / max(a1["atr"] * 2.5, 0.25)
+    n24 = ret_24h / max(a1["atr"] * 5.0, 0.50)
+    n7d = ret_7d / max(ad["atr"] * 3.0, 0.75)
+    n30d = ret_30d / max(ad["atr"] * 7.0, 1.0)
+    norm_momentum = 0.28 * n6 + 0.32 * n24 + 0.24 * n7d + 0.16 * n30d
+
+    trend_score = 50.0
+    trend_score += 8 if a1["trend"] else -7
+    trend_score += 13 if a4["trend"] else -12
+    trend_score += 15 if ad["trend"] else -15
+    trend_score += 8 if trend_1d_long else -7
+    trend_score += clamp(norm_momentum * 15.0, -18.0, 18.0)
+    trend_score = clamp(trend_score, 0.0, 100.0)
+
+    ext1 = a1["extension_atr"]
+    ext4 = a4["extension_atr"]
+    rebound = bool(ret_1h > 0 and a1["prev_bar"] <= 0 and a4["trend"] and ad["trend"])
+    controlled_pullback = bool(-1.25 <= ext1 <= 0.40 and a4["trend"] and ad["trend"])
+    acceleration = ret_1h - (ret_6h / 6.0)
+
+    timing_score = 50.0
+    timing_score += 10 if a4["trend"] else -12
+    timing_score += 10 if ad["trend"] else -14
+    timing_score += 6 if a1["trend"] else -4
+    timing_score += 9 if rebound else 0
+    timing_score += 7 if controlled_pullback else 0
+    timing_score += clamp(acceleration / max(a1["atr"], 0.10) * 18.0, -10.0, 10.0)
+    if 0.0 <= ext1 <= 1.20:
+        timing_score += 6
+    elif ext1 > SWING_MAX_EXTENSION_ATR:
+        timing_score -= clamp((ext1 - SWING_MAX_EXTENSION_ATR) * 18.0, 8.0, 28.0)
+    if ext4 > SWING_MAX_EXTENSION_ATR:
+        timing_score -= clamp((ext4 - SWING_MAX_EXTENSION_ATR) * 12.0, 6.0, 20.0)
+    if ret_30d > 60 and acceleration <= 0:
+        timing_score -= 10
+    timing_score = clamp(timing_score, 0.0, 100.0)
+
+    pre_rank_score = clamp(0.62 * trend_score + 0.38 * timing_score, 0.0, 97.0)
+
+    legacy_score = 50
+    legacy_score += 15 if a1["trend"] else -12
+    legacy_score += 18 if a4["trend"] else -15
+    legacy_score += 18 if ad["trend"] else -18
+    legacy_score += 6 if trend_1d_long else -5
+    legacy_score += clamp(ret_6h / 2.0 * 8, -8, 8)
+    legacy_score += clamp(ret_24h_4h / 5.0 * 8, -8, 8)
+    legacy_score = int(clamp(round(legacy_score), 0, 100))
+
+    relative_momentum_raw = (
+        0.25 * n6 + 0.30 * n24 + 0.25 * n7d + 0.20 * n30d
+    )
+
+    return {
+        "market": market,
