@@ -1,0 +1,119 @@
+    if saved_state and saved_state.get("version") in ("0.511", "0.512", "0.5121", "0.5122", "0.513", "0.5131", "0.514", "0.515", "0.516", "0.520", "0.521", "0.522") and saved_state.get("quote") in ("EUR", "USDC"):
+        quote = saved_state["quote"]
+    else:
+        quote = select_quote(markets_meta, ticker_24h)
+
+    # First REST books are also needed for optional EUR<->USDC valuation.
+    books = get_live_books(force_rest=True)
+    load_or_create_state(books)
+
+    refresh_learning_cache(force=True)
+    refresh_universe(force=True)
+    refresh_day_candles(force=True)
+    refresh_day_context(force=True)
+    refresh_swing(force=True)
+    books = get_live_books(force_rest=True)
+
+    store.event("START", f"v{VERSION} quote={quote} markets={len(universe)} ws={WEBSOCKETS_AVAILABLE}")
+
+    while True:
+        started = time.time()
+        try:
+            refresh_universe()
+            refresh_day_candles()
+            refresh_day_context()
+            refresh_swing()
+            books = get_live_books()
+            now = time.time()
+            apply_ws_candles()
+            apply_ws_5m_candles()
+            data_health(books)
+
+            # Populate fast 15s/60s history from live bid/ask stream.
+            for m in universe:
+                row = books.get(m)
+                if not row:
+                    continue
+                bid, ask = ticker_bid_ask(row)
+                if bid > 0 and ask > bid:
+                    hist = price_history[m]
+                    if not hist or now - hist[-1][0] >= 0.75:
+                        hist.append((now, (bid + ask) / 2.0))
+
+            regime, breadth = compute_regime()
+            day_results = []
+            for m in universe:
+                row = books.get(m)
+                if row:
+                    a = calculate_day_score(m, row, now, regime, breadth)
+                    if a:
+                        day_results.append(a)
+            day_results.sort(key=lambda x: (x["score"], x["expected_edge_pct"], -x["spread_pct"]), reverse=True)
+            if day_results:
+                last_top_day_display = [dict(a) for a in day_results[:3]]
+                early_rank = sorted((a for a in day_results if a.get("market") in early_universe), key=lambda x: (x.get("early_score",0), x.get("score",0)), reverse=True)
+                if early_rank:
+                    last_top_early_display = [dict(a) for a in early_rank[:3]]
+            day_by_market = {a["market"]: a for a in day_results}
+
+            swing_results = []
+            if SWING_ENABLED:
+                for m in swing_analysis_cache:
+                    row = books.get(m)
+                    if row:
+                        a = combine_swing_with_book(m, row, regime, breadth)
+                        if a:
+                            swing_results.append(a)
+                enrich_swing_cross_section(swing_results)
+                swing_results.sort(key=lambda x: (x["score"], x.get("timing_score",0), x.get("relative_strength_pct",0), x["expected_edge_pct"]), reverse=True)
+                if swing_results:
+                    last_top_swing_display = [dict(a) for a in swing_results[:4]]
+            swing_by_market = {a["market"]: a for a in swing_results}
+
+            manage_positions(day_by_market, swing_by_market, books)
+            eq_e = equity_eur(books)
+            reset_day_if_needed(eq_e)
+            update_recovery_lock(eq_e, day_by_market)
+
+            # Rotation only if slots/cash are constrained and a much better opportunity appears.
+            ok_day, reason_day = can_open("DAY", eq_e)
+            if (not ok_day and reason_day in ("day slots vol", "geen cash")) and day_results:
+                maybe_rotate(day_results)
+
+            ok_swing, reason_swing = can_open("SWING", eq_e) if SWING_ENABLED else (False, "off")
+            if SWING_ENABLED and (not ok_swing and reason_swing in ("swing slot vol", "geen cash")) and swing_results:
+                maybe_rotate_swing(swing_results)
+
+            try_entries(day_results, swing_results, eq_e)
+
+            # One signal snapshot per minute, not every 2s.
+            if now - last_signal_log >= SIGNAL_LOG_SECONDS:
+                for a in day_results[:6]:
+                    store.log_signal(a, "DAY")
+                for a in swing_results[:4]:
+                    store.log_signal(a, "SWING")
+                update_shadows(day_results, swing_results, books)
+                last_signal_log = now
+
+            # Live monitoring is best-effort and runs in a background thread.
+            # Airtable outages can never stop trading/paper execution.
+            telemetry.maybe_sync(day_results, swing_results, books, regime, breadth)
+
+            dashboard(day_results, swing_results, books, regime, breadth)
+
+        except KeyboardInterrupt:
+            print("\nBot gestopt. State/trades zijn opgeslagen.")
+            save_state()
+            break
+        except Exception as e:
+            store.event("LOOP_ERROR", repr(e))
+            print(f"\nFout: {e}")
+            print("Herstart poging over 8 sec...")
+            time.sleep(8)
+
+        elapsed = time.time() - started
+        time.sleep(max(0.25, DASHBOARD_SECONDS - elapsed))
+
+
+if __name__ == "__main__":
+    main()
