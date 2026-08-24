@@ -1,0 +1,164 @@
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                time.time(), now_iso(), a["market"], strategy, a["score"],
+                a.get("regime", "?"), a.get("setup_type", "?"),
+                a.get("quality", "?"), a.get("spread_pct", 0.0),
+                a.get("vol_ratio", 1.0), local_hour(), local_weekday(),
+                json.dumps(ctx)
+            ))
+            self.db.commit()
+
+    def trade(self, t):
+        with self.lock:
+            self.db.execute("""
+                INSERT INTO trades(
+                    strategy, opened_at, closed_at, market, quote,
+                    entry, exit, amount_base, position_quote,
+                    entry_fee, exit_fee, pnl, pnl_pct, reason,
+                    entry_score, entry_spread_pct, stop_pct, target_pct,
+                    mfe_pct, mae_pct, duration_seconds, regime, setup_type,
+                    quality, hour, weekday, context_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                t["strategy"], t["opened_at"], t["closed_at"], t["market"], t["quote"],
+                t["entry"], t["exit"], t["amount_base"], t["position_quote"],
+                t["entry_fee"], t["exit_fee"], t["pnl"], t["pnl_pct"], t["reason"],
+                t["entry_score"], t["entry_spread_pct"], t["stop_pct"], t["target_pct"],
+                t["mfe_pct"], t["mae_pct"], t["duration_seconds"], t["regime"],
+                t["setup_type"], t["quality"], t["hour"], t["weekday"],
+                json.dumps(t.get("context", {}))
+            ))
+            self.db.commit()
+
+    def stats(self, strategy=None):
+        q = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0), COALESCE(SUM(pnl),0), COALESCE(AVG(pnl_pct),0) FROM trades"
+        args = ()
+        if strategy:
+            q += " WHERE strategy=?"
+            args = (strategy,)
+        with self.lock:
+            r = self.db.execute(q, args).fetchone()
+        return {"count": int(r[0]), "wins": int(r[1]), "pnl": float(r[2]), "avg_pct": float(r[3])}
+
+    def performance_report(self, strategy=None, limit=200):
+        q = "SELECT pnl, pnl_pct FROM trades"
+        args = []
+        if strategy:
+            q += " WHERE strategy=?"
+            args.append(strategy)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        with self.lock:
+            rows = self.db.execute(q, tuple(args)).fetchall()
+        pnls = [float(r[0] or 0.0) for r in rows]
+        pcts = [float(r[1] or 0.0) for r in rows]
+        wins = [x for x in pnls if x > 0]
+        losses = [x for x in pnls if x <= 0]
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        avg_win = gross_profit / len(wins) if wins else 0.0
+        avg_loss = sum(losses) / len(losses) if losses else 0.0
+        payoff = avg_win / abs(avg_loss) if avg_loss < 0 else (float("inf") if avg_win > 0 else 0.0)
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        n = len(rows)
+        expectancy = sum(pnls) / n if n else 0.0
+        if n < 20:
+            verdict = f"WARMING {n}/20"
+        elif expectancy > 0 and profit_factor >= 1.10:
+            verdict = "PROMISING"
+        elif expectancy < 0 or profit_factor < 0.90:
+            verdict = "NEEDS_REVIEW"
+        else:
+            verdict = "MIXED"
+        return {
+            "n": n, "wins": len(wins), "losses": len(losses),
+            "winrate": len(wins) / n if n else 0.0,
+            "avg_win": avg_win, "avg_loss": avg_loss,
+            "payoff_ratio": payoff, "profit_factor": profit_factor,
+            "expectancy": expectancy,
+            "avg_pct": sum(pcts) / len(pcts) if pcts else 0.0,
+            "verdict": verdict,
+        }
+
+    def grouped_expectancy(self, field, strategy="DAY", min_samples=8, limit=100):
+        allowed = {"market", "hour", "weekday", "regime", "setup_type", "quality"}
+        if field not in allowed:
+            return {}
+        q = f"""
+            SELECT {field}, COUNT(*), AVG(pnl_pct), SUM(pnl)
+            FROM trades
+            WHERE strategy=?
+            GROUP BY {field}
+            HAVING COUNT(*) >= ?
+            ORDER BY COUNT(*) DESC
+            LIMIT ?
+        """
+        with self.lock:
+            rows = self.db.execute(q, (strategy, min_samples, limit)).fetchall()
+        return {str(r[0]): {"n": int(r[1]), "avg_pct": float(r[2]), "pnl": float(r[3])} for r in rows}
+
+    def create_shadow(self, variant, a, strategy, horizon_seconds, cost_pct):
+        # At most one unresolved signal for same market/variant/strategy.
+        with self.lock:
+            row = self.db.execute("""
+                SELECT id FROM shadow
+                WHERE variant=? AND market=? AND strategy=? AND resolved=0
+                LIMIT 1
+            """, (variant, a["market"], strategy)).fetchone()
+            if row:
+                return
+            self.db.execute("""
+                INSERT INTO shadow(
+                    created_ts, variant, market, strategy, entry_ask,
+                    entry_score, cost_pct, horizon_seconds, resolved
+                ) VALUES(?,?,?,?,?,?,?,?,0)
+            """, (
+                time.time(), variant, a["market"], strategy, a["ask"],
+                a["score"], cost_pct, horizon_seconds
+            ))
+            self.db.commit()
+
+    def unresolved_shadows(self):
+        with self.lock:
+            rows = self.db.execute("""
+                SELECT id, created_ts, variant, market, strategy, entry_ask,
+                       cost_pct, horizon_seconds
+                FROM shadow WHERE resolved=0
+            """).fetchall()
+        return rows
+
+    def resolve_shadow(self, sid, net_return_pct):
+        with self.lock:
+            self.db.execute("""
+                UPDATE shadow SET resolved=1, resolved_ts=?, net_return_pct=?
+                WHERE id=?
+            """, (time.time(), net_return_pct, sid))
+            self.db.commit()
+
+    def shadow_report(self):
+        with self.lock:
+            rows = self.db.execute("""
+                SELECT variant, COUNT(*), AVG(net_return_pct),
+                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END)
+                FROM shadow
+                WHERE resolved=1
+                GROUP BY variant
+                ORDER BY variant
+            """).fetchall()
+        return {
+            r[0]: {"n": int(r[1]), "avg": float(r[2]), "wins": int(r[3])}
+            for r in rows
+        }
+
+    def exit_efficiency(self, limit=50):
+        with self.lock:
+            rows = self.db.execute("""
+                SELECT context_json, pnl_pct, mfe_pct, reason
+                FROM trades ORDER BY id DESC LIMIT ?
+            """, (int(limit),)).fetchall()
+        net_caps = []
+        gross_caps = []
+        for ctx_json, pnl_pct, mfe_pct, reason in rows:
+            try:
+                ctx = json.loads(ctx_json or "{}")
+            except Exception:
