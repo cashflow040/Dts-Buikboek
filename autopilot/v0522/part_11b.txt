@@ -1,0 +1,117 @@
+        exposure = 100.0 * total_exposure_quote() / max(eq_q, 1e-9)
+        risk = 100.0 * open_risk_quote() / max(eq_q, 1e-9)
+
+        recovery = "ARM" if state.get("recovery_armed") else "off"
+        if state.get("recovery_floor_eur"):
+            recovery = f"LOCK €{state['recovery_floor_eur']:.2f}"
+
+        day_results = payload["day_results"]
+        swing_results = payload["swing_results"]
+
+        compact_positions = []
+        for p in positions():
+            row = books.get(p["market"], {})
+            bid, _ = ticker_bid_ask(row)
+            mv = pct_change(bid, p["entry"]) if bid > 0 else 0.0
+            compact_positions.append({
+                "mode": p.get("strategy"),
+                "market": p.get("market"),
+                "move_pct": round(mv, 4),
+                "mfe_pct": round(p.get("mfe_pct", 0.0), 4),
+                "mae_pct": round(p.get("mae_pct", 0.0), 4),
+                "net_peak_pct": round(position_net_peak_pct(p), 4),
+                "profit_lock_net_pct": round(p.get("profit_lock_net_pct", 0.0), 4),
+                "entry_score": p.get("entry_score"),
+                "entry_confirmations": p.get("entry_confirmations"),
+                "entry_confirmation_passed": p.get("entry_confirmation_passed"),
+                "stop_pct": p.get("stop_pct"),
+                "target_pct": p.get("target_pct"),
+                "entry_breadth": round(safe_float(p.get("entry_breadth"), 0.5), 4),
+                "entry_timing_score": round(safe_float(p.get("entry_timing_score"), 50), 2),
+                "entry_relative_strength_pct": round(safe_float(p.get("entry_relative_strength_pct"), 50), 2),
+            })
+
+        day_ready, day_rejects = rejection_summary(day_results, "DAY")
+        swing_ready, swing_rejects = rejection_summary(swing_results, "SWING")
+
+        telemetry_day_show = day_display_candidates(day_results, books, 3)
+
+        status = {
+            "ws": wsfeed.status(),
+            "quote": quote,
+            "breadth": payload["breadth"],
+            "scanned_markets": len(universe),
+            "day_ready": day_ready,
+            "swing_ready": swing_ready,
+            "day_rejects": day_rejects,
+            "swing_rejects": swing_rejects,
+            "day_pnl_pct": pct_change(eq_e, state.get("day_start_equity_eur", eq_e)),
+            "loss_streak": state.get("loss_streak", 0),
+            "hard_halt": state.get("hard_halt", False),
+            "positions": compact_positions,
+            "day_confirmation_required": DAY_ENTRY_CONFIRMATIONS,
+            "day_confirmation_gap_s": DAY_CONFIRMATION_MIN_SECONDS,
+            "swing_confirmation_required": SWING_ENTRY_CONFIRMATIONS,
+            "swing_confirmation_gap_s": SWING_CONFIRMATION_MIN_SECONDS,
+            "early_stream_markets": len(early_universe),
+            "day_coverage": round(runtime_health.get("day_coverage", 0.0), 4),
+            "swing_coverage": round(runtime_health.get("swing_coverage", 0.0), 4),
+            "day_candles": runtime_health.get("day_candles", 0),
+            "day_total": runtime_health.get("day_total", len(universe)),
+            "quote_live": runtime_health.get("quote_live", 0),
+            "quote_total": runtime_health.get("quote_total", len(universe)),
+            "ws_live": runtime_health.get("ws_live", 0),
+            "ws_total": runtime_health.get("ws_total", len(universe)),
+            "ws_subscribed": runtime_health.get("ws_subscribed", 0),
+            "ws_candle_1m_subscribed": runtime_health.get("ws_candle_1m_subscribed", 0),
+            "ws_candle_5m_subscribed": runtime_health.get("ws_candle_5m_subscribed", 0),
+            "ws_trade_subscribed": runtime_health.get("ws_trade_subscribed", 0),
+            "ws_event_age_s": round(runtime_health.get("ws_event_age_s", 999.0), 2),
+            "exit_efficiency": store.exit_efficiency(50),
+            "performance": store.performance_report(limit=200),
+            "data_errors": int(runtime_health.get("data_errors", 0)),
+            "top_day": [
+                {"m": a["market"], "s": a.get("score", 0), "q": a.get("quality"),
+                 "spr": round(a.get("spread_pct", 0), 4),
+                 "edge": round(a.get("expected_edge_pct", 0), 4),
+                 "chk": day_confirmation_info(a["market"])[0],
+                 "state": candidate_status(a, "DAY")}
+                for a in telemetry_day_show
+            ],
+            "top_early": [
+                {"m": a["market"], "e": a.get("early_score", 0), "s": a.get("score", 0),
+                 "flow": round(a.get("flow_accel", 1.0), 3), "part": round(a.get("flow_participation", 0.0), 3),
+                 "buy": round(a.get("buy_pressure", 0.0), 3), "persist": round(a.get("early_persistence",0.0),3), "fakeout": bool(a.get("early_fakeout",False))}
+                for a in sorted((x for x in day_results if x.get("market") in early_universe),
+                                key=lambda x: (x.get("early_score", 0), x.get("score", 0)), reverse=True)[:3]
+            ],
+            "top_swing": [
+                {"m": a["market"], "s": a["score"], "q": a.get("quality"),
+                 "spr": round(a.get("spread_pct", 0), 4),
+                 "timing": round(a.get("timing_score", 0), 1), "rank": round(a.get("relative_strength_pct", 0), 1),
+                 "ext": round(max(a.get("extension_1h_atr",0), a.get("extension_4h_atr",0)), 2),
+                 "cost_eff": round(a.get("cost_efficiency",0), 2), "breadth": round(a.get("breadth",0.5),3),
+                 "net_opp": round(a.get("net_opportunity_pct",0),3), "cost_mult": round(a.get("opportunity_cost_multiple",0),2),
+                 "a_plus": bool(a.get("a_plus",False)), "chk": int(swing_confirmation_state[a["market"]].get("count",0)),
+                 "state": candidate_status(a, "SWING")}
+                for a in swing_results[:4]
+            ],
+        }
+
+        return {
+            "fldczLTnEm0uUlBu3": f"snap-{int(payload['ts'])}",
+            "fldZdqiq5Q3JgBhaw": iso_with_offset(),
+            "fldkcsBSoHAMIM7mG": VERSION,
+            "fldc4jUnm5UsxBBlJ": round(eq_e, 4),
+            "fldrTHO0WhdVv9zsc": round(quote_value_eur(state.get("balance", 0.0), books), 4),
+            "fldv7apzrvvXfFijx": exposure / 100.0,
+            "fldWcnoHbDk3SqWMZ": risk / 100.0,
+            "fldo8hZ89BMSv8tqc": payload["regime"] if payload["regime"] in ("BULL","CHOP","BEAR","PANIC") else "UNKNOWN",
+            "fldewrVcNsedSfcfQ": len(positions("DAY")),
+            "fldDbE5HEAxPbYZZD": len(positions("SWING")),
+            "fldFzDW6vkdIfqF9W": day_results[0]["market"] if day_results else "",
+            "fldJuQRw4oXo2UeWT": day_results[0]["score"] if day_results else 0,
+            "fldcVwwxH3rHOkBsk": swing_results[0]["market"] if swing_results else "",
+            "fldavfVGKHo9cNYy9": swing_results[0]["score"] if swing_results else 0,
+            "fldrWCSG7ylxCBkIv": recovery,
+            "fldunBzHsPnoGVyOz": self._learning_text(),
