@@ -1,0 +1,132 @@
+        print(f"        net {net:+.2f}% | MFE {p.get('mfe_pct',0):+.2f}% | LOCK {lock:+.2f}%")
+
+    # Always show the most recent BUY/SELL action for a short period.
+    if ui_trade_events:
+        ev = ui_trade_events[0]
+        age = time.time() - ev.get("ts", 0)
+        if age <= 180:
+            print("-" * 58)
+            if ev.get("side") == "BUY":
+                print(f"BUY  {ev.get('market')} | {ev.get('strategy')} | {_price_fmt(ev.get('price'))} | score {ev.get('score')}")
+            else:
+                print(f"SELL {ev.get('market')} | {ev.get('pnl_pct',0):+.2f}% | {ev.get('pnl',0):+.2f} {quote} | {ev.get('reason')}")
+
+    print("-" * 58)
+    print("BESTE KANSEN")
+    day_show = day_display_candidates(day_results, books, 1)
+    if day_show:
+        a = day_show[0]
+        print(f"  DAY   {a['market']:<11} {a['score']:>3}  {candidate_status(a,'DAY')}")
+    else:
+        print("  DAY   -")
+    if swing_results:
+        a = swing_results[0]
+        grade = "A+" if a.get("a_plus") else ""
+        print(f"  SWING {a['market']:<11} {a['score']:>3} {grade:<2}  {candidate_status(a,'SWING')}")
+    else:
+        print("  SWING -")
+    early_rows = sorted((a for a in day_results if a.get("market") in early_universe), key=lambda x:(x.get("early_score",0),x.get("score",0)), reverse=True)
+    if early_rows:
+        a = early_rows[0]
+        tag = "BUILD" if a.get("early_score",0) >= EARLY_BUILD_SCORE else "WATCH"
+        print(f"  EARLY {a['market']:<11} E{a.get('early_score',0):>3}  {tag}")
+    else:
+        print("  EARLY -")
+
+    print("-" * 58)
+    data_ok = runtime_health.get("quote_live",0) >= max(1, int(len(universe)*0.70)) and runtime_health.get("data_errors",0) == 0
+    live_txt = "OK" if data_ok else "CHECK"
+    air_txt = telemetry.status()
+    print(f"LIVE DATA {live_txt} | AIRTABLE {air_txt} | ERR {runtime_health.get('data_errors',0)}")
+    if wsfeed.status() != "WS":
+        print("⚠ WS OFFLINE/FALLBACK")
+    if state.get("hard_halt"):
+        print("⚠ RISK HALT")
+    if runtime_health.get("data_errors",0) > 0:
+        print("⚠ DATA ERROR - details staan in Airtable/log")
+
+    wr = perf.get("winrate",0)*100
+    pf = perf.get("profit_factor",0.0)
+    pf_txt = "∞" if isinstance(pf,float) and math.isinf(pf) else f"{pf:.2f}"
+    print(f"Trades {perf.get('n',0)} | Wins {perf.get('wins',0)} ({wr:.0f}%) | Exp {perf.get('expectancy',0):+.3f} {quote} | PF {pf_txt}")
+    print(f"Eval: {perf.get('verdict','WARMING')} | details -> Airtable | CTRL+C stopt")
+
+
+# ============================================================
+# STARTUP SELF-CHECK
+# ============================================================
+
+def startup_self_check():
+    problems = []
+    if not (70 <= MAX_MARKETS <= 100):
+        problems.append(f"MAX_MARKETS={MAX_MARKETS} buiten 70-100")
+    if DAY_ENTRY_CONFIRMATIONS != 3:
+        problems.append("DAY confirmation is niet 3x")
+    if not (0 < DAY_CONFIRMATION_MIN_SECONDS < DAY_CONFIRMATION_TIMEOUT_SECONDS):
+        problems.append("confirmation timing ongeldig")
+    if MAX_SWING_POSITIONS != 2:
+        problems.append("SWING slots moeten 2 zijn")
+    if SWING_SLOT2_MIN_SCORE < SWING_BASE_ENTRY_SCORE:
+        problems.append("slot2 threshold lager dan normale SWING threshold")
+    if MAX_TOTAL_EXPOSURE_PCT > 100 or MAX_OPEN_RISK_PCT <= 0:
+        problems.append("portfolio risk config ongeldig")
+    if DAY_MIN_ANALYSIS_COVERAGE < 0.5 or DAY_MIN_ANALYSIS_COVERAGE > 1.0:
+        problems.append("data coverage threshold ongeldig")
+    if EARLY_STREAM_MARKETS < 5 or EARLY_STREAM_MARKETS > MAX_MARKETS:
+        problems.append("EARLY stream config ongeldig")
+    if DAY_CANDLE_HISTORY_LIMIT < 120 or DAY_CONTEXT_5M_LIMIT < 120:
+        problems.append("historische context te kort")
+    if not (0.0 < SWING_PEAK_LOCK_KEEP_FRAC < SWING_STRONG_PEAK_KEEP_FRAC < SWING_RUNNER_PEAK_KEEP_FRAC < 1.0):
+        problems.append("SWING net peak-lock fracties ongeldig")
+    if SWING_PEAK_LOCK_ARM_NET_PCT <= 0 or DAY_PEAK_LOCK_ARM_NET_PCT <= 0:
+        problems.append("profit-lock arming ongeldig")
+    if not (0 < DAY_CONFIRMATION_MIN_FULL_CHECKS <= DAY_ENTRY_CONFIRMATIONS):
+        problems.append("confirmation full-check config ongeldig")
+    if SWING_FAST_ENTRY_GAP_SECONDS >= SWING_ENTRY_GAP_SECONDS or SWING_FAST_SLOT2_SCORE < SWING_SLOT2_MIN_SCORE:
+        problems.append("fast slot2 config ongeldig")
+    if not (0 < EARLY_MIN_FLOW_PARTICIPATION < 2.0) or EARLY_MIN_TRADES_60S < 2:
+        problems.append("EARLY flow participation config ongeldig")
+    if DAY_CANDLE_REFRESH_SECONDS < 300 or DAY_CONTEXT_REFRESH_SECONDS < DAY_CANDLE_REFRESH_SECONDS:
+        problems.append("REST healing cadence te agressief")
+    if DAY_MAX_ENTRY_IMPACT_PCT <= 0 or SWING_MAX_ENTRY_IMPACT_PCT <= 0:
+        problems.append("execution impact threshold ongeldig")
+    if FULL_TOPBOOK_REFRESH_SECONDS < 5 or HEALTH_QUOTE_FRESH_SECONDS <= FULL_TOPBOOK_REFRESH_SECONDS:
+        problems.append("topbook/quote freshness config ongeldig")
+    if not (0 < SWING_MIN_TIMING_SCORE <= SWING_CHOP_MIN_TIMING_SCORE <= SWING_BEAR_MIN_TIMING_SCORE <= 100):
+        problems.append("SWING timing thresholds ongeldig")
+    if not (0 <= SWING_MIN_REL_STRENGTH_PCT < SWING_SLOT2_MIN_REL_STRENGTH_PCT <= 100):
+        problems.append("SWING relative-rank thresholds ongeldig")
+    if SWING_MIN_COST_EFFICIENCY <= 1 or SWING_HARD_EXTENSION_ATR <= SWING_MAX_EXTENSION_ATR:
+        problems.append("SWING cost/extension gate ongeldig")
+    if SWING_FAILURE_MINUTES <= SWING_REGIME_BREAK_MINUTES:
+        problems.append("SWING failure/regime timing ongeldig")
+    if SWING_ENTRY_CONFIRMATIONS < 2 or SWING_CONFIRMATION_MIN_SECONDS <= 0:
+        problems.append("SWING confirmation config ongeldig")
+    if not (0 < SWING_MIN_NET_OPPORTUNITY_PCT < 5):
+        problems.append("SWING net-opportunity config ongeldig")
+    if not (0 < SWING_A_PLUS_RISK_BOOST <= 1.10):
+        problems.append("A+ risk boost ongeldig")
+    if not (0 < ENTRY_MIN_QUOTE_COVERAGE <= 1):
+        problems.append("data-health coverage ongeldig")
+    try:
+        store.db.execute("SELECT 1").fetchone()
+    except Exception as e:
+        problems.append(f"database: {e}")
+    if problems:
+        raise RuntimeError("SELFTEST FAIL: " + "; ".join(problems))
+    store.event("SELFTEST_OK", f"v{VERSION} day_checks=3 swing_checks={SWING_ENTRY_CONFIRMATIONS} markets={MAX_MARKETS} swing_slots={MAX_SWING_POSITIONS}")
+    return True
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def main():
+    global markets_meta, ticker_24h, quote, last_signal_log, last_top_day_display, last_top_early_display, last_top_swing_display
+
+    print(f"Autopilot v{VERSION} starten...")
+    startup_self_check()
+    print("SELFTEST OK | SWING 2x confirm + net edge | A+ risk | COMPACT UI | PAPER")
+    markets_meta = fetch_markets()
+    ticker_24h = fetch_ticker_24h()
+    saved_state = store.get("state")
