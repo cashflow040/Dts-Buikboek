@@ -1,0 +1,180 @@
+        st = day_confirmation_state[a.get("market", "?")]
+        if not reasons:
+            return f"CHECK {count}/{DAY_ENTRY_CONFIRMATIONS}"
+        if count and st.get("last_reason") == "prearm":
+            return f"ARM {count}/{DAY_ENTRY_CONFIRMATIONS} " + "+".join(reasons[:1])
+        return "WAIT:" + "+".join(reasons[:2])
+    if reasons:
+        return "WAIT:" + "+".join(reasons[:2])
+    if a.get("market") in position_market_set():
+        return "OPEN"
+    cnt = int(swing_confirmation_state[a.get("market", "?")].get("count", 0))
+    if cnt < SWING_ENTRY_CONFIRMATIONS:
+        return f"CHECK {cnt}/{SWING_ENTRY_CONFIRMATIONS}"
+    if len(positions("SWING")) >= MAX_SWING_POSITIONS:
+        return "READY:QUEUE"
+    allowed, why = swing_slot_allowed(a)
+    return "READY" if allowed else f"WAIT:{why}"
+
+
+def merge_display_candidates(current, cached, limit=4):
+    """Keep the newest ranking, filling temporary gaps from the last known top list."""
+    out = []
+    seen = set()
+    for a in list(current) + list(cached):
+        m = a.get("market")
+        if not m or m in seen:
+            continue
+        out.append(a)
+        seen.add(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def day_display_candidates(day_results, books, limit=3):
+    """Always render 3 DAY rows; placeholders are used only when live scoring is incomplete."""
+    out = merge_display_candidates(day_results[:limit], last_top_day_display, limit)
+    seen = {a.get("market") for a in out}
+    if len(out) >= limit:
+        return out[:limit]
+    for market in universe:
+        if market in seen:
+            continue
+        row = books.get(market, {}) if books else {}
+        spr = market_spread_pct(row)
+        out.append({
+            "market": market, "score": 0,
+            "quality": quality_tier(market, ticker_24h.get(market, {})),
+            "spread_pct": spr if spr < 900 else 0.0,
+            "_placeholder": True,
+        })
+        seen.add(market)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+class AirtableTelemetry:
+    """
+    Best-effort monitoring only.
+    Trading NEVER depends on Airtable availability.
+    Network writes run in a background thread, so telemetry can't block the bot.
+    """
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.last_snapshot_ts = 0.0
+        self.syncing = False
+        self.last_ok_ts = 0.0
+        self.last_error = ""
+        self.sent_snapshots = 0
+
+    def token(self):
+        return load_airtable_token()
+
+    def status(self):
+        if not self.token():
+            return "SETUP"
+        with self.lock:
+            if self.last_error and (time.time() - self.last_ok_ts > 900):
+                return "ERR"
+            if self.syncing:
+                return "SYNC"
+            if self.last_ok_ts:
+                age = int((time.time() - self.last_ok_ts) / 60)
+                return f"OK {age}m"
+        return "READY"
+
+    def _post_records(self, table_id, records):
+        token = self.token()
+        if not token or not records:
+            return
+        # Airtable accepts batches; stay conservative at 10 records/request.
+        for i in range(0, len(records), 10):
+            batch = records[i:i+10]
+            url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_id}"
+            body = json.dumps({"records": [{"fields": r} for r in batch], "typecast": True}).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": f"AutopilotPaperBot/{VERSION}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=TELEMETRY_HTTP_TIMEOUT) as resp:
+                    resp.read()
+            except Exception as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", errors="ignore")[:1200]
+                except Exception:
+                    pass
+                payload_hint = json.dumps(batch[0], ensure_ascii=False)[:900] if batch else ""
+                raise RuntimeError(f"Airtable {table_id}: {e} {detail} payload={payload_hint}") from e
+
+    def _trade_rows_after(self, last_id, limit=100):
+        with store.lock:
+            return store.db.execute("""
+                SELECT id, strategy, opened_at, closed_at, market, quote,
+                       entry, exit, position_quote, entry_fee, exit_fee,
+                       pnl, pnl_pct, reason, entry_score, regime, mfe_pct,
+                       mae_pct, duration_seconds, context_json
+                FROM trades
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+            """, (last_id, limit)).fetchall()
+
+    def _trade_record(self, r):
+        (
+            rid, strategy, opened_at, closed_at, market, q,
+            entry, exitp, position_quote, entry_fee, exit_fee,
+            pnl, pnl_pct, reason, entry_score, regime, mfe_pct,
+            mae_pct, duration_seconds, context_json
+        ) = r
+        ctx = {}
+        try:
+            ctx = json.loads(context_json or "{}")
+        except Exception:
+            pass
+        ctx["quote"] = q
+        return {
+            "fldhrE7qcans3291i": f"trade-{rid}",
+            "fld5bjxwO8CBkuLIF": iso_with_offset(opened_at),
+            "fldCG6qRzvYiuUlwR": iso_with_offset(closed_at),
+            "fld8vTaUew0mLMaHF": strategy,
+            "fldz6sjh3VBnxo9ag": market,
+            "fldY6mDUGSosp5IOK": float(entry or 0),
+            "fldhrtJ6nZkBUFdTA": float(exitp or 0),
+            "fldz6bD2CReulDr2g": float(position_quote or 0),
+            "fldkneIvy5WLRAPD4": float(pnl or 0),
+            "fldAQZdKxg8nONHoT": float(pnl_pct or 0) / 100.0,
+            "fldSstxIZx8GC9C8E": float(entry_fee or 0) + float(exit_fee or 0),
+            "fld1dYGiNBYQi5qiB": float(ctx.get("slippage_pct", 0.0)) / 100.0,
+            "fldr7oTeE8a9MPz2J": float(entry_score or 0),
+            "fldYunlndk7E5gbjB": regime or "?",
+            "fldsVTHUYdZop0tzi": float(mfe_pct or 0) / 100.0,
+            "fldrgZE8gCxARw9ti": float(mae_pct or 0) / 100.0,
+            "fldmglPzjZ5q8PuBo": float(duration_seconds or 0) / 60.0,
+            "fldsyW10JtJxGP3Iz": reason or "?",
+            "fld02qSXUge1e5d3T": json.dumps(ctx, separators=(",", ":"))[:95000],
+        }
+
+    def _learning_text(self):
+        rep = store.shadow_report()
+        if not rep:
+            return "warming"
+        return " ".join(
+            f"{k}:{v['avg']:+.2f}%/{v['n']}"
+            for k, v in list(rep.items())[:5]
+        )[:900]
+
+    def _snapshot_record(self, payload):
+        books = payload["books"]
+        eq_q = equity_quote(books)
+        eq_e = equity_eur(books)
