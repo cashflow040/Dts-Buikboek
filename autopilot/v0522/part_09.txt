@@ -1,0 +1,337 @@
+            "SWING_ROTATE",
+            f"{p['market']} -> {best['market']} gap={score_gap} move={move:+.2f}% open={opened}:{reason}",
+        )
+        return opened
+    return False
+
+
+# ============================================================
+# SHADOW STRATEGIES / LEARNING REPORT
+# ============================================================
+
+SHADOW_THRESHOLDS = (74, 78, 82, 86)
+SHADOW_HORIZON_SECONDS = 15 * 60
+
+
+def update_shadows(day_results, swing_results, books):
+    for a in day_results[:12]:
+        meta = markets_meta.get(a["market"], {})
+        cost = expected_cost_pct(meta, a["spread_pct"])
+        for th in SHADOW_THRESHOLDS:
+            if a["score"] >= th and a["trend_up"] and a["spread_pct"] <= MAX_ENTRY_SPREAD_PCT:
+                store.create_shadow(f"DAY_T{th}", a, "DAY", SHADOW_HORIZON_SECONDS, cost)
+        if (a.get("early_score", 0) >= EARLY_BUILD_SCORE and
+            a.get("trade_count_60s", 0) >= EARLY_MIN_TRADES_60S and
+            a.get("flow_participation", 0) >= EARLY_MIN_FLOW_PARTICIPATION and
+            a.get("spread_pct", 99) <= EARLY_MAX_SPREAD_PCT):
+            store.create_shadow("EARLY_5M", a, "EARLY", 5 * 60, cost)
+            store.create_shadow("EARLY_15M", a, "EARLY", 15 * 60, cost)
+            store.create_shadow("EARLY_60M", a, "EARLY", 60 * 60, cost)
+
+    for a in swing_results[:16]:
+        cost = safe_float(a.get("estimated_cost_pct"), expected_cost_pct(markets_meta.get(a["market"], {}), a.get("spread_pct", 0.0)))
+        if a.get("legacy_eligible"):
+            store.create_shadow("SWING_LEGACY_4H", a, "SWING", SWING_SHADOW_4H_SECONDS, cost)
+            store.create_shadow("SWING_LEGACY_24H", a, "SWING", SWING_SHADOW_24H_SECONDS, cost)
+        if not swing_521_gate_reasons(a, include_score=True):
+            store.create_shadow("SWING_521_4H", a, "SWING", SWING_SHADOW_4H_SECONDS, cost)
+            store.create_shadow("SWING_521_24H", a, "SWING", SWING_SHADOW_24H_SECONDS, cost)
+        if swing_eligible(a):
+            store.create_shadow("SWING_522_4H", a, "SWING", SWING_SHADOW_4H_SECONDS, cost)
+            store.create_shadow("SWING_522_24H", a, "SWING", SWING_SHADOW_24H_SECONDS, cost)
+
+    now = time.time()
+    for sid, created, variant, market, strategy, entry_ask, cost_pct, horizon in store.unresolved_shadows():
+        if now - created < horizon:
+            continue
+        row = books.get(market, {})
+        bid, _ = ticker_bid_ask(row)
+        if bid <= 0:
+            continue
+        raw = pct_change(bid, entry_ask)
+        fee_slip = max(0.0, cost_pct - market_spread_pct(row))
+        net = raw - fee_slip
+        store.resolve_shadow(sid, net)
+
+
+def learning_summary():
+    market = store.grouped_expectancy("market", "DAY", min_samples=8)
+    hour = store.grouped_expectancy("hour", "DAY", min_samples=12)
+    setup = store.grouped_expectancy("setup_type", "DAY", min_samples=12)
+
+    def best_worst(d):
+        if not d:
+            return None, None
+        items = list(d.items())
+        best = max(items, key=lambda x: x[1]["avg_pct"])
+        worst = min(items, key=lambda x: x[1]["avg_pct"])
+        return best, worst
+
+    return {
+        "market": best_worst(market),
+        "hour": best_worst(hour),
+        "setup": best_worst(setup),
+        "shadow": store.shadow_report(),
+    }
+
+
+# ============================================================
+# DATA REFRESH
+# ============================================================
+
+def refresh_universe(force=False):
+    global markets_meta, ticker_24h, universe, early_universe, last_universe_refresh
+    now = time.time()
+    if force or not markets_meta:
+        markets_meta = fetch_markets()
+    if force or now - last_universe_refresh >= UNIVERSE_REFRESH_SECONDS:
+        ticker_24h = fetch_ticker_24h()
+        base_universe = build_universe(markets_meta, ticker_24h, quote)
+        required = []
+        for p in positions() if state else []:
+            if p["market"] not in required:
+                required.append(p["market"])
+        base_universe = [m for m in base_universe if m not in required]
+        keep = max(0, MAX_MARKETS - len(required))
+        universe = base_universe[:keep] + required[:MAX_MARKETS]
+        early_universe = build_early_universe(universe, ticker_24h)
+        wsfeed.set_markets(universe, early_universe)
+        last_universe_refresh = now
+        store.event("UNIVERSE", f"{quote} markets={len(universe)}")
+
+
+def refresh_day_candles(force=False):
+    global day_candle_cache, day_analysis_cache, last_day_refresh
+    now = time.time()
+    if not force and now - last_day_refresh < DAY_CANDLE_REFRESH_SECONDS:
+        return
+    new_cache = dict(day_candle_cache)
+    for market in universe:
+        try:
+            new_cache[market] = fetch_candles(market, "1m", DAY_CANDLE_HISTORY_LIMIT)
+            time.sleep(0.02)
+        except Exception as e:
+            runtime_health["data_errors"] = int(runtime_health.get("data_errors", 0)) + 1
+            store.event("DATA_ERR", f"1m {market}: {e}")
+    day_candle_cache = new_cache
+    day_analysis_cache = {m: a for m in universe if (a := day_candle_analysis(m)) is not None}
+    data_health()
+    last_day_refresh = now
+
+
+def apply_ws_candles():
+    changed = []
+    snap = wsfeed.candle_snapshot("1m")
+    for market, candle in snap.items():
+        if market not in universe:
+            continue
+        arr = day_candle_cache.setdefault(market, [])
+        if arr and arr[-1][0] == candle[0]:
+            if arr[-1] != candle:
+                arr[-1] = list(candle)
+                changed.append(market)
+        elif not arr or candle[0] > arr[-1][0]:
+            arr.append(list(candle))
+            if len(arr) > DAY_CANDLE_HISTORY_LIMIT:
+                del arr[:-DAY_CANDLE_HISTORY_LIMIT]
+            changed.append(market)
+    for market in changed:
+        a = day_candle_analysis(market)
+        if a is not None:
+            day_analysis_cache[market] = a
+    return changed
+
+
+def apply_ws_5m_candles():
+    changed = []
+    snap = wsfeed.candle_snapshot("5m")
+    for market, candle in snap.items():
+        if market not in universe:
+            continue
+        arr = day_context_5m_cache.setdefault(market, [])
+        if arr and arr[-1][0] == candle[0]:
+            if arr[-1] != candle:
+                arr[-1] = list(candle)
+                changed.append(market)
+        elif not arr or candle[0] > arr[-1][0]:
+            arr.append(list(candle))
+            if len(arr) > DAY_CONTEXT_5M_LIMIT:
+                del arr[:-DAY_CONTEXT_5M_LIMIT]
+            changed.append(market)
+    for market in changed:
+        a = day_context_analysis(day_context_5m_cache.get(market, []))
+        if a is not None:
+            day_context_cache[market] = a
+    return changed
+
+
+def refresh_day_context(force=False):
+    global day_context_cache, day_context_5m_cache, last_day_context_refresh
+    now = time.time()
+    if not force and now - last_day_context_refresh < DAY_CONTEXT_REFRESH_SECONDS:
+        return
+    new_ctx = dict(day_context_cache)
+    for market in universe:
+        try:
+            c5 = fetch_candles(market, "5m", DAY_CONTEXT_5M_LIMIT)
+            day_context_5m_cache[market] = c5
+            a = day_context_analysis(c5)
+            if a is not None:
+                new_ctx[market] = a
+            time.sleep(0.015)
+        except Exception as e:
+            runtime_health["data_errors"] = int(runtime_health.get("data_errors", 0)) + 1
+            store.event("DATA_ERR", f"5mctx {market}: {e}")
+    day_context_cache = new_ctx
+    last_day_context_refresh = now
+
+def refresh_swing(force=False):
+    global swing_cache, swing_analysis_cache, last_swing_refresh
+    if not SWING_ENABLED:
+        return
+    now = time.time()
+    if not force and now - last_swing_refresh < SWING_REFRESH_SECONDS:
+        return
+    markets = universe[:SWING_UNIVERSE_MARKETS]
+    for p in positions("SWING") if state else []:
+        if p["market"] not in markets:
+            markets.append(p["market"])
+    for m in markets:
+        try:
+            swing_cache[m] = {
+                "1h": fetch_candles(m, "1h", 168),
+                "4h": fetch_candles(m, "4h", 180),
+                "1d": fetch_candles(m, "1d", 180),
+            }
+            time.sleep(0.05)
+        except Exception as e:
+            runtime_health["data_errors"] = int(runtime_health.get("data_errors", 0)) + 1
+            store.event("DATA_ERR", f"swing {m}: {e}")
+    swing_analysis_cache = {m: a for m in markets if (a := swing_analysis_market(m)) is not None}
+    data_health()
+    last_swing_refresh = now
+
+
+def get_live_books(force_rest=False):
+    global last_rest_ticker, rest_books_cache, _last_books_snapshot
+    now = time.time()
+    ws = wsfeed.snapshot()
+    ws_good = wsfeed.status() == "WS"
+
+    need_full_topbook = (
+        force_rest or not rest_books_cache or
+        now - last_rest_ticker >= FULL_TOPBOOK_REFRESH_SECONDS or
+        (not ws_good and now - last_rest_ticker >= REST_TICKER_FALLBACK_SECONDS)
+    )
+    if need_full_topbook:
+        try:
+            rest_books_cache = fetch_books_all()
+            last_rest_ticker = now
+        except Exception as e:
+            runtime_health["data_errors"] = int(runtime_health.get("data_errors", 0)) + 1
+            store.event("TICKER_ERR", e)
+
+    merged = dict(rest_books_cache)
+    if ws_good:
+        for m, row in ws.items():
+            rest_row = merged.get(m, {})
+            if safe_float(row.get("ts"), 0.0) >= safe_float(rest_row.get("ts"), 0.0):
+                merged[m] = row
+    _last_books_snapshot = merged
+    return merged
+
+
+# ============================================================
+# ENTRY LOGIC
+# ============================================================
+
+def data_health(books=None):
+    day_total = max(1, len(universe))
+    day_count = sum(1 for m in universe if m in day_analysis_cache)
+    swing_target_markets = list(universe[:SWING_UNIVERSE_MARKETS])
+    for p in positions("SWING") if state else []:
+        if p.get("market") not in swing_target_markets:
+            swing_target_markets.append(p.get("market"))
+    swing_total = max(1, len(swing_target_markets)) if SWING_ENABLED else 1
+    swing_count = sum(1 for m in swing_target_markets if m in swing_analysis_cache) if SWING_ENABLED else 1
+
+    books = current_books() if books is None else books
+    now = time.time()
+    quote_live = 0
+    for m in universe:
+        row = books.get(m, {}) if books else {}
+        bid, ask = ticker_bid_ask(row)
+        ts = safe_float(row.get("ts"), 0.0)
+        age = max(0.0, now - ts) if ts else 999.0
+        if bid > 0 and ask > bid and age <= HEALTH_QUOTE_FRESH_SECONDS:
+            quote_live += 1
+
+    ws_rows = wsfeed.snapshot()
+    ws_live = 0
+    for m in universe:
+        row = ws_rows.get(m, {})
+        bid, ask = ticker_bid_ask(row)
+        ts = safe_float(row.get("ts"), 0.0)
+        age = max(0.0, now - ts) if ts else 999.0
+        if bid > 0 and ask > bid and age <= HEALTH_WS_FRESH_SECONDS:
+            ws_live += 1
+    wss = wsfeed.subscription_status()
+
+    runtime_health.update({
+        "day_coverage": clamp(day_count / day_total, 0.0, 1.0),
+        "swing_coverage": clamp(swing_count / swing_total, 0.0, 1.0),
+        "day_candles": day_count, "day_total": day_total,
+        "swing_candles": swing_count, "swing_total": swing_total,
+        "quote_live": quote_live, "quote_total": len(universe),
+        "ws_live": ws_live, "ws_total": len(universe),
+        "ws_subscribed": wss.get("ticker", 0),
+        "ws_candle_1m_subscribed": wss.get("candles_1m", 0),
+        "ws_candle_5m_subscribed": wss.get("candles_5m", 0),
+        "ws_trade_subscribed": wss.get("trades", 0),
+        "ws_event_age_s": wss.get("last_event_age_s", 999.0),
+    })
+    return runtime_health["day_coverage"], runtime_health["swing_coverage"]
+
+def day_quality_allowed(a):
+    if a.get("quality") != "C":
+        return True
+    normal_exception = (
+        a.get("regime") == "BULL" and
+        a.get("score", 0) >= DAY_QUALITY_C_EXCEPTION_SCORE and
+        a.get("spread_pct", 99) <= DAY_QUALITY_C_MAX_SPREAD_PCT and
+        a.get("vol_ratio", 0) >= DAY_QUALITY_C_MIN_VOLUME
+    )
+    early_exception = (
+        a.get("regime") in ("BULL", "CHOP") and
+        a.get("early_score", 0) >= EARLY_ENTRY_QUALITY_C_SCORE and
+        a.get("spread_pct", 99) <= EARLY_MAX_SPREAD_PCT and
+        a.get("vol_ratio", 0) >= EARLY_MIN_VOL_RATIO and
+        a.get("flow_accel", 1.0) >= EARLY_MIN_FLOW_ACCEL and
+        a.get("buy_pressure", 0.0) >= EARLY_MIN_BUY_PRESSURE
+    )
+    return normal_exception or early_exception
+
+def day_confirmation_info(market):
+    st = day_confirmation_state[market]
+    return int(st.get("count", 0)), float(st.get("last_ts", 0.0))
+
+def reset_day_confirmation(market, reason="reset"):
+    st = day_confirmation_state[market]
+    st.update({"count": 0, "full_count": 0, "first_ts": 0.0, "last_ts": 0.0,
+               "last_score": None, "last_reason": reason, "scores": []})
+    confirmations[market] = 0
+
+def update_day_confirmation(a, eligible, now=None, prearm=False):
+    now = time.time() if now is None else now
+    market = a["market"]
+    st = day_confirmation_state[market]
+    if not eligible and not prearm:
+        reset_day_confirmation(market, entry_reject_reason(a, "DAY"))
+        return 0
+    if st.get("count", 0) and now - st.get("last_ts", 0.0) > DAY_CONFIRMATION_TIMEOUT_SECONDS:
+        reset_day_confirmation(market, "timeout")
+        st = day_confirmation_state[market]
+    last_score = st.get("last_score")
+    if last_score is not None and a.get("score", 0) < float(last_score) - DAY_CONFIRMATION_SCORE_DROP_RESET:
+        reset_day_confirmation(market, "score drop")
+        st = day_confirmation_state[market]
