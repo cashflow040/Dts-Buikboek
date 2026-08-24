@@ -1,0 +1,304 @@
+    if st.get("count", 0) == 0 or now - st.get("last_ts", 0.0) >= DAY_CONFIRMATION_MIN_SECONDS:
+        if st.get("count", 0) == 0:
+            st["first_ts"] = now
+        st["count"] = min(DAY_ENTRY_CONFIRMATIONS, int(st.get("count", 0)) + 1)
+        if eligible:
+            st["full_count"] = min(DAY_ENTRY_CONFIRMATIONS, int(st.get("full_count", 0)) + 1)
+        st["last_ts"] = now
+        st["last_score"] = a.get("score", 0)
+        st["last_reason"] = "eligible" if eligible else "prearm"
+        scores = list(st.get("scores") or [])
+        scores.append(float(a.get("score", 0)))
+        st["scores"] = scores[-DAY_ENTRY_CONFIRMATIONS:]
+        confirmations[market] = st["count"]
+        kind = "DAY_CHECK" if eligible else "DAY_PREARM"
+        store.event(kind, f"{market} check {st['count']}/{DAY_ENTRY_CONFIRMATIONS} full={st.get('full_count',0)} score={a.get('score',0)}")
+    return int(st.get("count", 0))
+
+def day_confirmation_quality_ok(a):
+    st = day_confirmation_state[a["market"]]
+    if int(st.get("count", 0)) < DAY_ENTRY_CONFIRMATIONS:
+        return False
+    if int(st.get("full_count", 0)) < DAY_CONFIRMATION_MIN_FULL_CHECKS:
+        return False
+    scores = [safe_float(x) for x in (st.get("scores") or [])]
+    if len(scores) < DAY_ENTRY_CONFIRMATIONS:
+        return False
+    threshold = day_entry_threshold(a)
+    if statistics.mean(scores) < threshold + DAY_CONFIRMATION_AVG_BUFFER:
+        return False
+    if scores[-1] < max(scores) - DAY_CONFIRMATION_SCORE_DROP_RESET:
+        return False
+    if a.get("score_slope_15s", 0.0) < DAY_SCORE_SLOPE_MIN:
+        return False
+    return True
+
+def day_prearm_eligible(a):
+    if a.get("regime") not in ("BULL", "CHOP"):
+        return False
+    if a.get("quote_age_s", 999) > DAY_MAX_QUOTE_AGE_SECONDS or a.get("candle_age_s", 999) > DAY_MAX_CANDLE_AGE_SECONDS:
+        return False
+    if a.get("spread_pct", 99) > min(MAX_ENTRY_SPREAD_PCT, EARLY_MAX_SPREAD_PCT):
+        return False
+    if a.get("spread_shock", False) or not a.get("fast_ready", False):
+        return False
+    if a.get("early_score", 0) < DAY_PREARM_EARLY_SCORE:
+        return False
+    if a.get("early_fakeout", False) or a.get("early_persistence", 0.0) < 0.50:
+        return False
+    if a.get("score", 0) < day_entry_threshold(a) - DAY_PREARM_SCORE_MARGIN:
+        return False
+    if a.get("flow_accel", 0) < EARLY_MIN_FLOW_ACCEL or a.get("buy_pressure", -1) < EARLY_MIN_BUY_PRESSURE:
+        return False
+    if a.get("trade_count_60s", 0) < EARLY_MIN_TRADES_60S or a.get("flow_participation", 0) < EARLY_MIN_FLOW_PARTICIPATION:
+        return False
+    if a.get("score_slope_15s", 0) < 0:
+        return False
+    return True
+
+def day_late_entry_block(a):
+    fast60 = a.get("fast60", 0.0)
+    accel = a.get("price_accel", 0.0)
+    atr = max(0.05, a.get("atr_pct", 0.5))
+    ext = a.get("extension_pct", 0.0)
+    if fast60 >= DAY_LATE_FADE_FAST60_MIN and accel <= DAY_LATE_FADE_ACCEL_MAX:
+        return "late fade"
+    if fast60 >= DAY_CHASE_FAST60_PCT and ext >= atr * DAY_CHASE_EXTENSION_ATR:
+        return "chasing"
+    return ""
+
+def day_entry_threshold(a):
+    th = quality_threshold(a["quality"])
+    if a["regime"] == "BULL":
+        th -= 1
+    if a.get("setup_type") == "EARLY_BUILD" and a.get("early_score", 0) >= 88:
+        th -= 2
+    elif a["regime"] == "CHOP":
+        th += 1
+    elif a["regime"] == "BEAR":
+        th += 6
+    elif a["regime"] == "PANIC":
+        th += 20
+    return int(clamp(th, DAY_MIN_CONFIDENCE_PROXY, 99))
+
+
+def day_volume_floor(a):
+    return {
+        "BULL": DAY_VOLUME_FLOOR_BULL,
+        "CHOP": DAY_VOLUME_FLOOR_CHOP,
+        "BEAR": DAY_VOLUME_FLOOR_BEAR,
+        "PANIC": 9.0,
+    }.get(a.get("regime"), 1.0)
+
+
+def day_trend_momentum_ok(a):
+    if a.get("setup_type") == "EARLY_BUILD" and a.get("early_score", 0) >= EARLY_BUILD_SCORE:
+        return (
+            a.get("context_trend", False) and
+            a.get("m5", -99) >= -0.12 and
+            a.get("m15", -99) >= -0.25 and
+            a.get("fast60", 99) <= EARLY_MAX_FAST60_PCT and
+            a.get("flow_accel", 0) >= EARLY_MIN_FLOW_ACCEL and
+            a.get("buy_pressure", -1) >= EARLY_MIN_BUY_PRESSURE and
+            a.get("trade_count_60s", 0) >= EARLY_MIN_TRADES_60S and
+            a.get("flow_participation", 0) >= EARLY_MIN_FLOW_PARTICIPATION
+        )
+    if not a.get("trend_up", False):
+        return False
+    if a.get("m5", 0) > 0:
+        return True
+    return (
+        a.get("m5", -99) >= DAY_PULLBACK_M5_MIN and
+        a.get("m15", 0) > 0.10 and
+        a.get("setup_type") in ("PULLBACK", "MIXED")
+    )
+
+
+def day_eligible(a):
+    day_cov, _ = data_health()
+    if day_cov < DAY_MIN_ANALYSIS_COVERAGE:
+        return False
+    if not day_quality_allowed(a):
+        return False
+    if a["regime"] == "PANIC":
+        return False
+    if a.get("quote_age_s", 999) > DAY_MAX_QUOTE_AGE_SECONDS:
+        return False
+    if a.get("candle_age_s", 999) > DAY_MAX_CANDLE_AGE_SECONDS:
+        return False
+    if a["spread_pct"] > MAX_ENTRY_SPREAD_PCT or a.get("spread_shock", False):
+        return False
+    if not a.get("fast_ready", False):
+        return False
+    if day_late_entry_block(a):
+        return False
+    if not day_trend_momentum_ok(a):
+        return False
+    if a["fast60"] < DAY_FAST60_MIN:
+        return False
+    if a["vol_ratio"] < day_volume_floor(a):
+        return False
+    if a["expected_edge_pct"] < MIN_NET_EDGE_PCT:
+        return False
+    if a["score"] < day_entry_threshold(a):
+        return False
+    if a["regime"] == "BEAR":
+        if a["score"] < DAY_BEAR_EXCEPTION_SCORE:
+            return False
+        if a["expected_edge_pct"] < DAY_BEAR_EXCEPTION_EDGE_PCT:
+            return False
+        if a["vol_ratio"] < 1.20:
+            return False
+    return True
+
+
+def swing_timeframes_ok(a):
+    if not (a.get("trend_4h") and a.get("trend_1d")):
+        return False
+    if a.get("trend_1h"):
+        return True
+    return bool(a.get("controlled_pullback") or a.get("rebound")) and a.get("ret_1h", -99) > -1.50
+
+
+def swing_research_gate_reasons(a, include_score=True):
+    reasons = []
+    if a.get("quality") == "C":
+        reasons.append("quality C")
+    if a.get("regime") == "PANIC":
+        reasons.append("panic")
+    if a.get("spread_pct", 99) > MAX_ENTRY_SPREAD_PCT:
+        reasons.append("spread")
+    if not swing_timeframes_ok(a):
+        reasons.append("timeframes")
+
+    regime = a.get("regime", "CHOP")
+    timing_min = SWING_BEAR_MIN_TIMING_SCORE if regime == "BEAR" else (SWING_CHOP_MIN_TIMING_SCORE if regime == "CHOP" else SWING_MIN_TIMING_SCORE)
+    rank_min = SWING_BEAR_MIN_REL_STRENGTH_PCT if regime == "BEAR" else (SWING_CHOP_MIN_REL_STRENGTH_PCT if regime == "CHOP" else SWING_MIN_REL_STRENGTH_PCT)
+    if a.get("timing_score", 0) < timing_min:
+        reasons.append("timing")
+    if a.get("relative_strength_pct", 0) < rank_min:
+        reasons.append("relative rank")
+    if max(a.get("extension_1h_atr", 0.0), a.get("extension_4h_atr", 0.0)) > SWING_HARD_EXTENSION_ATR:
+        reasons.append("overextended")
+    if a.get("cost_efficiency", 0.0) < SWING_MIN_COST_EFFICIENCY:
+        reasons.append("cost/vol")
+    if a.get("net_opportunity_pct", 0.0) < SWING_MIN_NET_OPPORTUNITY_PCT:
+        reasons.append("net opportunity")
+    if a.get("opportunity_cost_multiple", 0.0) < SWING_MIN_OPPORTUNITY_COST_MULT:
+        reasons.append("cost multiple")
+    qtotal = max(1, int(runtime_health.get("quote_total", len(universe) or 1)))
+    if safe_float(runtime_health.get("quote_live"), 0.0) / qtotal < ENTRY_MIN_QUOTE_COVERAGE:
+        reasons.append("data health")
+    if regime == "CHOP" and a.get("breadth", 0.5) < SWING_CHOP_BREADTH_FLOOR:
+        if not (a.get("quality") == "A" and a.get("timing_score", 0) >= 82 and a.get("relative_strength_pct", 0) >= 82):
+            reasons.append("thin breadth")
+    if regime == "BEAR" and not a.get("trend_1d_long", False):
+        reasons.append("long trend")
+    if include_score:
+        threshold = SWING_BEAR_EXCEPTION_SCORE if regime == "BEAR" else SWING_BASE_ENTRY_SCORE
+        if a.get("score", 0) < threshold:
+            reasons.append("bear score" if regime == "BEAR" else "score")
+    return list(dict.fromkeys(reasons))
+
+
+def swing_521_gate_reasons(a, include_score=True):
+    reasons = []
+    if a.get("quality") == "C": reasons.append("quality C")
+    if a.get("regime") == "PANIC": reasons.append("panic")
+    if a.get("spread_pct", 99) > MAX_ENTRY_SPREAD_PCT: reasons.append("spread")
+    if not swing_timeframes_ok(a): reasons.append("timeframes")
+    regime = a.get("regime", "CHOP")
+    timing_min = SWING_BEAR_MIN_TIMING_SCORE if regime == "BEAR" else (SWING_CHOP_MIN_TIMING_SCORE if regime == "CHOP" else SWING_MIN_TIMING_SCORE)
+    rank_min = SWING_BEAR_MIN_REL_STRENGTH_PCT if regime == "BEAR" else (SWING_CHOP_MIN_REL_STRENGTH_PCT if regime == "CHOP" else SWING_MIN_REL_STRENGTH_PCT)
+    if a.get("timing_score", 0) < timing_min: reasons.append("timing")
+    if a.get("relative_strength_pct", 0) < rank_min: reasons.append("relative rank")
+    if max(a.get("extension_1h_atr",0), a.get("extension_4h_atr",0)) > SWING_HARD_EXTENSION_ATR: reasons.append("overextended")
+    if a.get("cost_efficiency",0) < SWING_MIN_COST_EFFICIENCY: reasons.append("cost/vol")
+    if regime == "CHOP" and a.get("breadth",0.5) < SWING_CHOP_BREADTH_FLOOR:
+        if not (a.get("quality") == "A" and a.get("timing_score",0) >= 82 and a.get("relative_strength_pct",0) >= 82): reasons.append("thin breadth")
+    if regime == "BEAR" and not a.get("trend_1d_long",False): reasons.append("long trend")
+    if include_score:
+        threshold = SWING_BEAR_EXCEPTION_SCORE if regime == "BEAR" else SWING_BASE_ENTRY_SCORE
+        if a.get("score",0) < threshold: reasons.append("bear score" if regime == "BEAR" else "score")
+    return list(dict.fromkeys(reasons))
+
+def swing_eligible(a):
+    return not swing_research_gate_reasons(a, include_score=True)
+
+
+def entry_reject_reasons(a, strategy):
+    if a.get("_placeholder"):
+        return ["data"]
+    reasons = []
+    if strategy == "DAY":
+        day_cov, _ = data_health()
+        if day_cov < DAY_MIN_ANALYSIS_COVERAGE:
+            reasons.append("data health")
+        if not day_quality_allowed(a):
+            reasons.append("quality C")
+        if a.get("regime") == "PANIC":
+            reasons.append("panic")
+        if a.get("quote_age_s", 999) > DAY_MAX_QUOTE_AGE_SECONDS:
+            reasons.append("stale quote")
+        if a.get("candle_age_s", 999) > DAY_MAX_CANDLE_AGE_SECONDS:
+            reasons.append("stale candle")
+        if a.get("spread_pct", 99) > MAX_ENTRY_SPREAD_PCT:
+            reasons.append("spread")
+        if a.get("spread_shock", False):
+            reasons.append("spread shock")
+        if not a.get("fast_ready", False):
+            reasons.append("warming")
+        late_block = day_late_entry_block(a)
+        if late_block:
+            reasons.append(late_block)
+        if a.get("early_fakeout", False):
+            reasons.append("early fakeout")
+        if a.get("setup_type") == "EARLY_BUILD" and (a.get("trade_count_60s", 0) < EARLY_MIN_TRADES_60S or a.get("flow_participation", 0) < EARLY_MIN_FLOW_PARTICIPATION):
+            reasons.append("thin flow")
+        if not day_trend_momentum_ok(a):
+            reasons.append("trend/m5")
+        if a.get("fast60", 0) < DAY_FAST60_MIN:
+            reasons.append("1m")
+        if a.get("vol_ratio", 0) < day_volume_floor(a):
+            reasons.append("volume")
+        if a.get("expected_edge_pct", 0) < MIN_NET_EDGE_PCT:
+            reasons.append("edge")
+        if a.get("score", 0) < day_entry_threshold(a):
+            reasons.append("score")
+        if a.get("regime") == "BEAR":
+            if a.get("score", 0) < DAY_BEAR_EXCEPTION_SCORE and "score" not in reasons:
+                reasons.append("bear score")
+            if a.get("expected_edge_pct", 0) < DAY_BEAR_EXCEPTION_EDGE_PCT and "edge" not in reasons:
+                reasons.append("bear edge")
+            if a.get("vol_ratio", 0) < 1.20 and "volume" not in reasons:
+                reasons.append("bear volume")
+    else:
+        reasons.extend(swing_research_gate_reasons(a, include_score=True))
+    return list(dict.fromkeys(reasons))
+
+
+def entry_reject_reason(a, strategy):
+    reasons = entry_reject_reasons(a, strategy)
+    return reasons[0] if reasons else "eligible"
+
+
+def rejection_summary(results, strategy):
+    counts = defaultdict(int)
+    ready = 0
+    for a in results:
+        reason = entry_reject_reason(a, strategy)
+        if reason == "eligible":
+            ready += 1
+        else:
+            counts[reason] += 1
+    return ready, dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
+
+
+def candidate_status(a, strategy):
+    reasons = entry_reject_reasons(a, strategy)
+    if strategy == "DAY":
+        count, _ = day_confirmation_info(a.get("market", "?"))
+        st = day_confirmation_state[a.get("market", "?")]
+        if not reasons:
+            return f"CHECK {count}/{DAY_ENTRY_CONFIRMATIONS}"
+        if count and st.get("last_reason") == "prearm":
