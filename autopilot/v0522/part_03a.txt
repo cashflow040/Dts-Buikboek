@@ -1,0 +1,163 @@
+                ctx = {}
+            nc = ctx.get("net_peak_capture_ratio")
+            gc = ctx.get("peak_capture_ratio")
+            if nc is not None and math.isfinite(safe_float(nc, float("nan"))):
+                net_caps.append(clamp(safe_float(nc), -2.0, 2.0))
+            elif gc is not None and math.isfinite(safe_float(gc, float("nan"))):
+                gross_caps.append(clamp(safe_float(gc), -2.0, 2.0))
+        arr = net_caps if net_caps else gross_caps
+        return {
+            "n": len(arr),
+            "avg": statistics.mean(arr) if arr else None,
+            "median": statistics.median(arr) if arr else None,
+            "basis": "net" if net_caps else ("gross" if gross_caps else "none"),
+        }
+
+
+store = Store(DB_FILE)
+
+
+# ============================================================
+# REALTIME PUBLIC TICKER FEED (OPTIONAL WEBSOCKET)
+# ============================================================
+
+class WSMarketFeed:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.data = {}
+        self.candle_data = {}  # keyed by (market, interval)
+        self.trade_flow = defaultdict(lambda: deque(maxlen=5000))
+        self.market_last_event = {}
+        self.subscribed = {"ticker": set(), "candles_1m": set(), "candles_5m": set(), "trades": set()}
+        self.last_subscription_ts = 0.0
+        self.markets = []
+        self.trade_markets = []
+        self.generation = 0
+        self.connected = False
+        self.last_event_ts = 0.0
+        self.last_candle_event_ts = 0.0
+        self.thread = None
+        self.stop_flag = False
+
+    def set_markets(self, markets, trade_markets=None):
+        markets = sorted(set(markets))
+        trade_markets = sorted(set(trade_markets or []))
+        with self.lock:
+            if markets != self.markets or trade_markets != self.trade_markets:
+                self.markets = markets
+                self.trade_markets = trade_markets
+                self.generation += 1
+        if WEBSOCKETS_AVAILABLE and (self.thread is None or not self.thread.is_alive()):
+            self.thread = threading.Thread(target=self._thread_main, daemon=True)
+            self.thread.start()
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.data)
+
+    def candle_snapshot(self, interval="1m"):
+        with self.lock:
+            return {m: list(c) for (m, iv), c in self.candle_data.items() if iv == interval}
+
+    def subscription_status(self):
+        with self.lock:
+            return {
+                "ticker": len(self.subscribed.get("ticker", set())),
+                "candles_1m": len(self.subscribed.get("candles_1m", set())),
+                "candles_5m": len(self.subscribed.get("candles_5m", set())),
+                "trades": len(self.subscribed.get("trades", set())),
+                "connected": bool(self.connected),
+                "last_event_age_s": (time.time() - self.last_event_ts) if self.last_event_ts else 999.0,
+                "last_subscription_age_s": (time.time() - self.last_subscription_ts) if self.last_subscription_ts else 999.0,
+            }
+
+    def flow_metrics(self, market, now=None):
+        now = time.time() if now is None else now
+        with self.lock:
+            q = self.trade_flow.get(market)
+            if not q:
+                return {"buy_pressure": 0.0, "flow_accel": 1.0, "trade_quote_15s": 0.0, "trade_quote_60s": 0.0, "trade_count_60s": 0}
+            while q and q[0][0] < now - 120.0:
+                q.popleft()
+            rows = list(q)
+        r15 = [x for x in rows if x[0] >= now - 15.0]
+        r60 = [x for x in rows if x[0] >= now - 60.0]
+        prev = [x for x in rows if now - 60.0 <= x[0] < now - 15.0]
+        q15 = sum(x[2] for x in r15)
+        q60 = sum(x[2] for x in r60)
+        qprev = sum(x[2] for x in prev)
+        prev_15_equiv = qprev / 3.0 if qprev > 0 else 0.0
+        if prev_15_equiv > 0:
+            accel = q15 / prev_15_equiv
+        elif q15 > 0:
+            accel = 2.0
+        else:
+            accel = 1.0
+        signed = sum(x[1] for x in r60)
+        pressure = signed / q60 if q60 > 0 else 0.0
+        return {
+            "buy_pressure": clamp(pressure, -1.0, 1.0),
+            "flow_accel": clamp(accel, 0.0, 8.0),
+            "trade_quote_15s": q15,
+            "trade_quote_60s": q60,
+            "trade_count_60s": len(r60),
+        }
+
+    def status(self):
+        if not WEBSOCKETS_AVAILABLE:
+            return "REST"
+        with self.lock:
+            age = time.time() - self.last_event_ts if self.last_event_ts else 999
+            sub_age = time.time() - self.last_subscription_ts if self.last_subscription_ts else 999
+            healthy = self.connected and (age < WS_STALE_GLOBAL_SECONDS or sub_age < WS_STALE_GLOBAL_SECONDS)
+            return "WS" if healthy else "REST"
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run())
+        except Exception as e:
+            store.event("WS_FATAL", e)
+
+    async def _run(self):
+        while not self.stop_flag:
+            with self.lock:
+                markets = list(self.markets)
+                trade_markets = list(self.trade_markets)
+                generation = self.generation
+            if not markets:
+                await asyncio.sleep(1)
+                continue
+            try:
+                async with websockets.connect(
+                    WS_URL,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_queue=10000,
+                ) as ws:
+                    channels = [
+                        {"name": "ticker", "markets": markets},
+                        {"name": "candles", "markets": markets, "interval": ["1m", "5m"]},
+                    ]
+                    if trade_markets:
+                        channels.append({"name": "trades", "markets": trade_markets})
+                    await ws.send(json.dumps({"action": "subscribe", "channels": channels}))
+                    with self.lock:
+                        self.connected = True
+                        self.subscribed = {"ticker": set(), "candles_1m": set(), "candles_5m": set(), "trades": set()}
+                    while not self.stop_flag:
+                        with self.lock:
+                            if generation != self.generation:
+                                break
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=35)
+                        except asyncio.TimeoutError:
+                            try:
+                                pong = await ws.ping()
+                                await asyncio.wait_for(pong, timeout=10)
+                                continue
+                            except Exception:
+                                break
+                        msg = json.loads(raw)
+                        ev = msg.get("event")
+                        if ev == "subscribed":
