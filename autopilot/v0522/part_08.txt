@@ -1,0 +1,269 @@
+            if age_min >= DAY_PEAK_LOCK_MIN_AGE_MIN and net_peak >= DAY_PEAK_LOCK_ARM_NET_PCT:
+                gross_floor = pos.get("cost_pct", 0.0) + net_peak * DAY_PEAK_LOCK_KEEP_FRAC
+                if move <= gross_floor:
+                    close_paper_trade(pos["id"], "DAY_PEAK_LOCK")
+                    continue
+
+            if pos.get("breakeven_active"):
+                be_need = pos["cost_pct"] + 0.04
+                if pos["mfe_pct"] >= max(be_need + 0.20, pos["stop_pct"]) and move <= be_need:
+                    close_paper_trade(pos["id"], "BREAKEVEN")
+                    continue
+
+            if pos.get("trail_active") and a:
+                trail_pct = clamp(a.get("atr_pct", 0.8) * DAY_TRAIL_ATR_MULT, 0.35, 1.50)
+                trail_price = pos["highest_bid"] * (1.0 - trail_pct / 100.0)
+                if bid <= trail_price:
+                    close_paper_trade(pos["id"], "TRAIL")
+                    continue
+
+            net_move = position_net_move_pct(pos, move)
+            if net_move >= POSITION_BOOK_EXIT_MIN_NET_PCT and a and a.get("score", 50) <= pos.get("entry_score", 50) - POSITION_BOOK_SCORE_DROP:
+                imb = position_book_imbalance(pos["market"])
+                if imb is not None and imb <= POSITION_BOOK_SELL_PRESSURE:
+                    close_paper_trade(pos["id"], "DAY_BOOK_REVERSAL")
+                    continue
+
+            if (time.time() - pos["opened_ts"]) / 60 >= DAY_MAX_TRADE_MINUTES:
+                close_paper_trade(pos["id"], "TIME")
+                continue
+
+            if a and (not a.get("trend_up")) and a.get("score", 50) < 45:
+                close_paper_trade(pos["id"], "TREND")
+                continue
+
+        else:
+            age_min = (time.time() - pos["opened_ts"]) / 60.0
+            age_hours = age_min / 60.0
+            net_peak = position_net_peak_pct(pos)
+            if age_min >= SWING_GIVEBACK_MIN_MINUTES and net_peak >= SWING_PEAK_LOCK_ARM_NET_PCT:
+                if net_peak >= SWING_RUNNER_PEAK_NET_PCT:
+                    keep_frac = SWING_RUNNER_PEAK_KEEP_FRAC
+                elif net_peak >= SWING_STRONG_PEAK_NET_PCT:
+                    keep_frac = SWING_STRONG_PEAK_KEEP_FRAC
+                else:
+                    keep_frac = SWING_PEAK_LOCK_KEEP_FRAC
+                locked_net = max(SWING_PEAK_LOCK_MIN_NET_PCT, net_peak * keep_frac)
+                dynamic_floor = pos.get("cost_pct", 0.0) + locked_net
+                pos["profit_lock_net_pct"] = locked_net
+                if move <= dynamic_floor:
+                    close_paper_trade(pos["id"], "SWING_PEAK_LOCK")
+                    continue
+
+            if move >= pos["target_pct"] or pos.get("mfe_pct", 0.0) >= SWING_TRAIL_ARM_MFE_PCT:
+                pos["trail_active"] = True
+            if pos.get("trail_active") and a:
+                trail_pct = clamp(a.get("atr_pct", 3.0) * SWING_TRAIL_ATR_MULT, 1.25, 5.0)
+                trail_price = pos["highest_bid"] * (1.0 - trail_pct / 100.0)
+                if bid <= trail_price:
+                    close_paper_trade(pos["id"], "SWING_TRAIL")
+                    continue
+
+            net_move = position_net_move_pct(pos, move)
+            entry_score = safe_float(pos.get("entry_score"), 0.0)
+            current_score = a.get("score", 50) if a else 50
+            current_timing = safe_float(a.get("timing_score"), 50.0) if a else 50.0
+            current_breadth = safe_float(a.get("breadth"), safe_float(pos.get("entry_breadth"), 0.5)) if a else safe_float(pos.get("entry_breadth"), 0.5)
+            entry_breadth = safe_float(pos.get("entry_breadth"), current_breadth)
+            entry_timing = safe_float(pos.get("entry_timing_score"), 50.0)
+            breadth_drop = entry_breadth - current_breadth
+
+            if (age_min >= SWING_FAST_RISKOFF_MINUTES and net_peak <= SWING_REGIME_MAX_NET_PEAK_PCT and
+                current_breadth <= SWING_FAST_RISKOFF_BREADTH_MAX and
+                breadth_drop >= SWING_FAST_RISKOFF_BREADTH_DROP and move <= -SWING_FAST_RISKOFF_LOSS_PCT):
+                close_paper_trade(pos["id"], "SWING_FAST_RISKOFF")
+                continue
+
+            if age_min >= SWING_REGIME_BREAK_MINUTES and net_peak <= SWING_REGIME_MAX_NET_PEAK_PCT:
+                regime_break = bool(a and a.get("regime") in ("BEAR", "PANIC"))
+                breadth_break = breadth_drop >= SWING_REGIME_BREADTH_DROP and move < -0.15
+                if (regime_break or breadth_break) and net_move < 0.05:
+                    close_paper_trade(pos["id"], "SWING_REGIME_BREAK")
+                    continue
+
+            if (
+                age_min >= SWING_FAILURE_MINUTES and
+                pos.get("mfe_pct", 0.0) <= SWING_FAILURE_MAX_MFE_PCT and
+                move <= -SWING_FAILURE_LOSS_PCT and
+                (current_timing <= entry_timing - SWING_FAILURE_TIMING_DROP or current_score <= entry_score - 8)
+            ):
+                close_paper_trade(pos["id"], "SWING_NO_PROGRESS")
+                continue
+
+            if net_move >= POSITION_BOOK_EXIT_MIN_NET_PCT and net_peak >= SWING_PEAK_LOCK_ARM_NET_PCT:
+                score_deteriorated = current_score <= entry_score - POSITION_BOOK_SCORE_DROP
+                if score_deteriorated:
+                    imb = position_book_imbalance(pos["market"])
+                    if imb is not None and imb <= POSITION_BOOK_SELL_PRESSURE:
+                        close_paper_trade(pos["id"], "SWING_BOOK_REVERSAL")
+                        continue
+
+            if (
+                age_hours >= SWING_WEAK_EXIT_MIN_HOURS and a and
+                (not a.get("trend_4h", True) or not a.get("trend_1d", True)) and
+                a.get("score", 50) < SWING_WEAK_EXIT_SCORE
+            ):
+                close_paper_trade(pos["id"], "SWING_TREND")
+                continue
+
+            if (
+                age_hours >= SWING_EARLY_STALE_HOURS and
+                pos.get("mfe_pct", 0.0) < SWING_EARLY_STALE_MFE_PCT and
+                move <= SWING_EARLY_STALE_MAX_MOVE_PCT and
+                current_score < SWING_BASE_ENTRY_SCORE
+            ):
+                close_paper_trade(pos["id"], "SWING_EARLY_STALE")
+                continue
+
+            if age_hours >= SWING_STALE_HOURS:
+                if pos.get("mfe_pct", 0.0) < SWING_STALE_MIN_PROGRESS_PCT or (move < 0.20 and current_score < SWING_BASE_ENTRY_SCORE):
+                    close_paper_trade(pos["id"], "SWING_STALE")
+                    continue
+
+            if (time.time() - pos["opened_ts"]) >= SWING_MAX_DAYS * 86400:
+                close_paper_trade(pos["id"], "SWING_TIME")
+                continue
+    save_state()
+
+
+# ============================================================
+# RECOVERY PROFIT LOCK
+# ============================================================
+
+def update_recovery_lock(eq_eur, day_by_market):
+    day_start = state.get("day_start_equity_eur", START_EUR)
+    state["session_low_eur"] = min(state.get("session_low_eur", eq_eur), eq_eur)
+    drawdown = pct_change(state["session_low_eur"], day_start) if day_start else 0.0
+
+    if drawdown <= -RECOVERY_ARM_DRAWDOWN_PCT:
+        state["recovery_armed"] = True
+
+    trigger = day_start * (1 + RECOVERY_TRIGGER_PROFIT_PCT / 100.0)
+    if state.get("recovery_armed") and eq_eur >= trigger:
+        state["recovery_floor_eur"] = day_start * (1 + RECOVERY_FLOOR_PROFIT_PCT / 100.0)
+
+    floor = state.get("recovery_floor_eur")
+    if floor and positions("DAY"):
+        band = floor * (1 + RECOVERY_HYSTERESIS_PCT / 100.0)
+        if eq_eur <= band and time.time() - state.get("last_recovery_lock_ts", 0) > 60:
+            ranked = []
+            books = current_books()
+            for p in positions("DAY"):
+                a = day_by_market.get(p["market"], {})
+                row = books.get(p["market"], {})
+                bid, _ = ticker_bid_ask(row)
+                move = pct_change(bid, p["entry"]) if bid > 0 else -999
+                ranked.append((a.get("score", 50), move, p))
+            ranked.sort(key=lambda x: (x[0], x[1]))
+            weakest = ranked[0][2]
+            if close_paper_trade(weakest["id"], "RECOVERY_LOCK"):
+                state["last_recovery_lock_ts"] = time.time()
+                store.event("RECOVERY", f"locked recovery by closing {weakest['market']}")
+                save_state()
+
+
+# ============================================================
+# ROTATION / OPPORTUNITY ENGINE
+# ============================================================
+
+def maybe_rotate(day_results):
+    if not day_results or not positions("DAY"):
+        return False
+    best = day_results[0]
+    if best["market"] in position_market_set() or pair_in_cooldown(best["market"]):
+        return False
+    if best["score"] < DAY_ROTATION_MIN_SCORE:
+        return False
+
+    books = current_books()
+    weakest = None
+    weakest_metric = None
+    for p in positions("DAY"):
+        a = next((x for x in day_results if x["market"] == p["market"]), None)
+        row = books.get(p["market"], {})
+        bid, _ = ticker_bid_ask(row)
+        move = pct_change(bid, p["entry"]) if bid > 0 else -99
+        score = a["score"] if a else 45
+        remaining_edge = max(0.0, p["target_pct"] - max(move, 0.0) - p["cost_pct"])
+        metric = score + remaining_edge * 5
+        if weakest_metric is None or metric < weakest_metric:
+            weakest_metric = metric
+            weakest = (p, score, move, remaining_edge)
+
+    if not weakest:
+        return False
+    p, current_score, move, remaining_edge = weakest
+    score_gap = best["score"] - current_score
+    edge_gap = best.get("expected_edge_pct", 0.0) - remaining_edge
+
+    if move >= max(0.5 * p["target_pct"], 0.45):
+        return False
+    if score_gap < DAY_ROTATION_SCORE_GAP or edge_gap < DAY_ROTATION_EDGE_GAP_PCT:
+        return False
+
+    if close_paper_trade(p["id"], "ROTATE_OUT"):
+        time.sleep(0.2)
+        opened, reason = open_paper_trade(best, "DAY")
+        store.event("ROTATE", f"{p['market']} -> {best['market']} gap={score_gap} edgegap={edge_gap:.2f} open={opened}:{reason}")
+        return opened
+    return False
+
+
+def maybe_rotate_swing(swing_results):
+    if len(positions("SWING")) < MAX_SWING_POSITIONS or not swing_results:
+        return False
+
+    held = position_market_set()
+    best = next(
+        (a for a in swing_results
+         if a["market"] not in held and not pair_in_cooldown(a["market"]) and swing_eligible(a)),
+        None,
+    )
+    if not best or best.get("score", 0) < SWING_ROTATION_MIN_SCORE:
+        return False
+
+    books = current_books()
+    weakest = None
+    weakest_metric = None
+    for p in positions("SWING"):
+        age_min = (time.time() - p["opened_ts"]) / 60.0
+        if age_min < SWING_ROTATION_MIN_AGE_MIN:
+            continue
+        a = next((x for x in swing_results if x["market"] == p["market"]), None)
+        row = books.get(p["market"], {})
+        bid, _ = ticker_bid_ask(row)
+        move = pct_change(bid, p["entry"]) if bid > 0 else -99
+        current_score = a.get("score", 50) if a else 50
+
+        net_move = position_net_move_pct(p, move)
+        net_peak = position_net_peak_pct(p)
+        if net_move >= 0.10 and current_score >= SWING_BASE_ENTRY_SCORE:
+            continue
+        if net_peak >= SWING_ROTATION_PROTECT_NET_PEAK_PCT and move > 0 and current_score >= SWING_ROTATION_PROTECT_SCORE:
+            continue
+
+        metric = current_score + max(move, -5.0) * 2.0 + min(p.get("mfe_pct", 0.0), 4.0)
+        if weakest_metric is None or metric < weakest_metric:
+            weakest_metric = metric
+            weakest = (p, current_score, move)
+
+    if not weakest:
+        return False
+
+    p, current_score, move = weakest
+    score_gap = best["score"] - current_score
+    current_a = next((x for x in swing_results if x["market"] == p["market"]), None) or {}
+    timing_gap = best.get("timing_score", 0) - current_a.get("timing_score", 50)
+    rank_gap = best.get("relative_strength_pct", 0) - current_a.get("relative_strength_pct", 50)
+    if move > -0.10 and timing_gap < 8 and rank_gap < 20:
+        return False
+    required_gap = 6 if best.get("score", 0) >= 98 else SWING_ROTATION_SCORE_GAP
+    if score_gap < required_gap:
+        return False
+    if move > 0 and current_score >= SWING_ROTATION_PROTECT_SCORE:
+        return False
+
+    if close_paper_trade(p["id"], "SWING_ROTATE_OUT"):
+        time.sleep(0.2)
+        opened, reason = open_paper_trade(best, "SWING")
+        store.event(
