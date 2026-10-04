@@ -13,108 +13,40 @@
   <meta name="apple-mobile-web-app-title" content="Buikboek">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="application-name" content="Buikboek">
-  <style>
-    html,body{margin:0;width:100%;height:100%;background:#090806;overflow:hidden}
-    iframe{position:fixed;inset:0;width:100%;height:100%;border:0;background:#090806}
-  </style>
+  <style>html,body{margin:0;width:100%;height:100%;background:#090806;overflow:hidden}iframe{position:fixed;inset:0;width:100%;height:100%;border:0;background:#090806}</style>
 </head>
 <body>
-  <iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=buikboek-204" title="Buikboek"></iframe>
-  <script>
-    (function(){
-      function makeCard(doc,id,emoji,title,subtitle,ingredients,method,imageSrc){
-        var card=doc.createElement('article');
-        card.className='recipe-card';
-        card.id=id;
-        var list='';
-        for(var i=0;i<ingredients.length;i++) list+='<li>'+ingredients[i]+'</li>';
-        var photo=imageSrc?'<img class="recipe-photo" src="'+imageSrc+'" alt="'+title+'" loading="lazy" referrerpolicy="no-referrer">':'';
-        card.innerHTML=photo+'<div class="recipe-head"><div class="emoji">'+emoji+'</div><div><h3>'+title+'</h3><p>'+subtitle+'</p></div></div><ul>'+list+'</ul><div class="method"><b>Bereiding:</b> '+method+'</div>';
-        return card;
-      }
-
-      function headingText(section){
-        var h=section.querySelector('h1,h2,h3');
-        return h ? h.textContent.replace(/\s+/g,' ').trim().toLowerCase() : '';
-      }
-
-      function findSection(doc,words){
-        var sections=doc.querySelectorAll('section,.section');
-        for(var i=0;i<sections.length;i++){
-          var t=headingText(sections[i]);
-          for(var j=0;j<words.length;j++) if(t.indexOf(words[j])!==-1) return sections[i];
-        }
-        return null;
-      }
-
-      function gridFor(doc,section){
-        var grid=section.querySelector('.grid');
-        if(!grid){grid=doc.createElement('div');grid.className='grid';section.appendChild(grid);}
-        return grid;
-      }
-
-      function insertBeforeFooter(doc,section){
-        var footer=doc.querySelector('.footer,footer');
-        if(footer && footer.parentNode) footer.parentNode.insertBefore(section,footer);
-        else doc.body.appendChild(section);
-      }
-
-      function addNavLink(doc,id,label){
-        var nav=doc.querySelector('.nav');
-        if(!nav || nav.querySelector('a[href="#'+id+'"]')) return;
-        var a=doc.createElement('a');
-        a.href='#'+id;
-        a.textContent=label;
-        nav.appendChild(a);
-      }
-
-      function inject(){
-        var frame=document.getElementById('buikboek-frame');
-        var doc;
-        try{doc=frame.contentDocument || frame.contentWindow.document;}catch(e){return false;}
-        if(!doc || !doc.body) return false;
-
-        var sauces=findSection(doc,['sausjes & dips','sauzen & dips','sausjes','sauzen','dips']);
-        if(!sauces){
-          sauces=doc.createElement('section');
-          sauces.className='section gold';
-          sauces.id='sausjes-en-dips';
-          sauces.innerHTML='<h2>SAUSJES & DIPS</h2><div class="grid"></div>';
-          insertBeforeFooter(doc,sauces);
-        }
-        if(!sauces.id) sauces.id='sausjes-en-dips';
-        addNavLink(doc,sauces.id,'Sausjes & Dips');
-
-        if(!doc.getElementById('sticky-korean-honey-chili-saus')){
-          gridFor(doc,sauces).appendChild(makeCard(doc,'sticky-korean-honey-chili-saus','🍯🌶️','Sticky Korean Honey Chili Saus','Pittig zoet • honingachtig • zonder koken',['3 el honing','1 el gochujang','1 el sweet chilisaus','1 tl sojasaus','1 tl rijstazijn of natuurazijn','Klein scheutje sesamolie, optioneel','Snufje MSG, optioneel'],'Meng alles koud tot een gladde, kleverige saus. Lekker over hete krokante kip of als dip. Meer honing maakt hem zoeter, meer gochujang pittiger en meer azijn frisser.','images/sticky-korean-honey-chili-ai.svg?v=1'));
-        }
-
-        var sides=findSection(doc,['bijgerechten']);
-        if(!sides){
-          sides=doc.createElement('section');
-          sides.className='section gold';
-          sides.id='bijgerechten';
-          sides.innerHTML='<h2>BIJGERECHTEN</h2><div class="grid"></div>';
-          insertBeforeFooter(doc,sides);
-        }
-        if(!sides.id) sides.id='bijgerechten';
-        addNavLink(doc,sides.id,'Bijgerechten');
-
-        if(!doc.getElementById('crostini-di-fegatini')){
-          gridFor(doc,sides).appendChild(makeCard(doc,'crostini-di-fegatini','🇮🇹🍞','Crostini di Fegatini','Toscaanse kippenleverpaté • licht korrelig • voor op brood',['500 g kippenlevers','1 ui, fijgesneden','2 tenen knoflook, fijngehakt','3 el olijfolie','50 g boter','100 ml droge witte wijn','5–6 salieblaadjes','2 ansjovisfilets','1 el kappertjes','Zout en zwarte peper'],'Bak de ui 8–10 minuten zacht in olijfolie. Voeg knoflook, salie, ansjovis en kappertjes toe. Bak de kippenlevers 4–5 minuten mee, blus af met witte wijn en laat bijna volledig inkoken. Voeg de boter toe en pulseer kort, zodat de paté bewust licht grof en korrelig blijft. Laat minimaal 2 uur koelen en serveer op geroosterd brood.','https://image.pollinations.ai/prompt/rustic%20Italian%20crostini%20di%20fegatini%20Tuscan%20chicken%20liver%20pate%20on%20toasted%20baguette%20wooden%20board%20warm%20natural%20light%20realistic%20food%20photography%20no%20text?width=640&height=568&seed=18473&nologo=true'));
-        }
-
-        if(!doc.getElementById('romige-bundelzwammen-bosui-ketjap')){
-          gridFor(doc,sides).appendChild(makeCard(doc,'romige-bundelzwammen-bosui-ketjap','🍄🌿','Romige Bundelzwammen met Bosui & Ketjap','Romig • hartig • licht zoetzuur • lekker met vers brood',['Bundelzwammen','Klontje roomboter','Beetje melk','Scheutje kookroom','Klein beetje sojasaus','Klein beetje ketjap manis','Paprikapoeder','Knoflookpoeder','Rozemarijn','Snufje MSG','Zwarte peper','Bosui, fijngesneden','Klein scheutje azijn','Zwarte sesamzaadjes','Vers brood van de bakker en roomboter, om erbij te serveren'],'Smelt een klontje boter op laag vuur en bak de bundelzwammen rustig. Voeg een beetje melk en een scheutje kookroom toe. Breng op smaak met sojasaus, ketjap, paprikapoeder, knoflookpoeder, rozemarijn, MSG en zwarte peper. Laat zachtjes indikken en schep het grootste gedeelte in een kom. Bak de bosui enkele minuten in de resten van de pan met een klein scheutje azijn. Verdeel dit over de romige bundelzwammen en werk af met zwarte sesamzaadjes. Serveer met vers bakkersbrood en roomboter.','https://image.pollinations.ai/prompt/creamy%20Asian%20fusion%20cluster%20mushrooms%20in%20a%20small%20rustic%20bowl%20topped%20with%20sauteed%20spring%20onion%20and%20black%20sesame%20seeds%20fresh%20artisan%20bread%20and%20butter%20beside%20it%20warm%20cozy%20restaurant%20lighting%20highly%20realistic%20food%20photography%20no%20text?width=640&height=568&seed=39172&nologo=true'));
-        }
-        return !!doc.getElementById('sticky-korean-honey-chili-saus') && !!doc.getElementById('crostini-di-fegatini') && !!doc.getElementById('romige-bundelzwammen-bosui-ketjap');
-      }
-
-      var tries=0;
-      var timer=setInterval(function(){tries++; if(inject() || tries>40) clearInterval(timer);},250);
-      document.getElementById('buikboek-frame').addEventListener('load',function(){inject(); setTimeout(inject,500); setTimeout(inject,1500);});
-      window.addEventListener('pageshow',inject);
-    })();
-  </script>
+<iframe id="buikboek-frame" src="kookboek-v15-updated-specials-1.html?v=buikboek-205" title="Buikboek"></iframe>
+<script>
+(function(){
+function makeCard(doc,id,emoji,title,subtitle,ingredients,method,imageSrc){var card=doc.createElement('article');card.className='recipe-card';card.id=id;var list='';for(var i=0;i<ingredients.length;i++)list+='<li>'+ingredients[i]+'</li>';var photo=imageSrc?'<img class="recipe-photo" src="'+imageSrc+'" alt="'+title+'" loading="lazy" referrerpolicy="no-referrer">':'';card.innerHTML=photo+'<div class="recipe-head"><div class="emoji">'+emoji+'</div><div><h3>'+title+'</h3><p>'+subtitle+'</p></div></div><ul>'+list+'</ul><div class="method"><b>Bereiding:</b> '+method+'</div>';return card;}
+function headingText(section){var h=section.querySelector('h1,h2,h3');return h?h.textContent.replace(/\s+/g,' ').trim().toLowerCase():'';}
+function findSection(doc,words){var sections=doc.querySelectorAll('section,.section');for(var i=0;i<sections.length;i++){var t=headingText(sections[i]);for(var j=0;j<words.length;j++)if(t.indexOf(words[j])!==-1)return sections[i];}return null;}
+function gridFor(doc,section){var grid=section.querySelector('.grid');if(!grid){grid=doc.createElement('div');grid.className='grid';section.appendChild(grid);}return grid;}
+function insertBeforeFooter(doc,section){var footer=doc.querySelector('.footer,footer');if(footer&&footer.parentNode)footer.parentNode.insertBefore(section,footer);else doc.body.appendChild(section);}
+function addNavLink(doc,id,label){var nav=doc.querySelector('.nav');if(!nav||nav.querySelector('a[href="#'+id+'"]'))return;var a=doc.createElement('a');a.href='#'+id;a.textContent=label;nav.appendChild(a);}
+function ensureSection(doc,words,id,title,nav){var s=findSection(doc,words);if(!s){s=doc.createElement('section');s.className='section gold';s.id=id;s.innerHTML='<h2>'+title+'</h2><div class="grid"></div>';insertBeforeFooter(doc,s);}if(!s.id)s.id=id;addNavLink(doc,s.id,nav);return s;}
+function add(doc,section,id,emoji,title,subtitle,ingredients,method,img){if(!doc.getElementById(id))gridFor(doc,section).appendChild(makeCard(doc,id,emoji,title,subtitle,ingredients,method,img));}
+function ai(prompt,seed){return 'https://image.pollinations.ai/prompt/'+prompt+'%20realistic%20food%20photography%20no%20text?width=640&height=568&seed='+seed+'&nologo=true';}
+function inject(){var frame=document.getElementById('buikboek-frame'),doc;try{doc=frame.contentDocument||frame.contentWindow.document;}catch(e){return false;}if(!doc||!doc.body)return false;
+var sauces=ensureSection(doc,['sausjes & dips','sauzen & dips','sausjes','sauzen','dips'],'sausjes-en-dips','SAUSJES & DIPS','Sausjes & Dips');
+add(doc,sauces,'sticky-korean-honey-chili-saus','🍯🌶️','Sticky Korean Honey Chili Saus','Pittig zoet • honingachtig • zonder koken',['3 el honing','1 el gochujang','1 el sweet chilisaus','1 tl sojasaus','1 tl rijstazijn of natuurazijn','Klein scheutje sesamolie, optioneel','Snufje MSG, optioneel'],'Meng alles koud tot een gladde, kleverige saus. Lekker over hete krokante kip of als dip. Meer honing maakt hem zoeter, meer gochujang pittiger en meer azijn frisser.','images/sticky-korean-honey-chili-ai.svg?v=1');
+add(doc,sauces,'romige-paddenstoelensaus','🍄','Romige Paddenstoelensaus','Diep hartig • romig • vol umami',['Champignons of gemengde paddenstoelen','Boter','Ui','Knoflook','Kookroom','Tijm','Zwarte peper','Parmezaan, optioneel'],'Bak de paddenstoelen goed donkerbruin in boter. Voeg ui, knoflook en tijm toe. Schenk kookroom erbij en laat kort indikken. Pureer glad met de staafmixer en maak af met zwarte peper en eventueel Parmezaan.',ai('creamy%20mushroom%20sauce%20in%20small%20bowl%20mushrooms%20herbs',48121));
+add(doc,sauces,'romige-broccolisaus','🥦','Romige Broccolisaus','Zacht • romig • fris',['Broccoli','Knoflook','Boter','Kookroom','Parmezaan','Zwarte peper','Klein kneepje citroen'],'Kook de broccoli zacht. Bak knoflook kort in boter, voeg broccoli en kookroom toe en pureer glad. Maak af met Parmezaan, zwarte peper en een klein kneepje citroen.',ai('creamy%20broccoli%20sauce%20green%20sauce%20small%20bowl',19374));
+add(doc,sauces,'geroosterde-tomaat-paprikasaus','🍅🫑','Geroosterde Tomaat-Paprikasaus','Zoet • geroosterd • romig',['Tomaten','Paprika','Ui','Knoflook','Kookroom'],'Rooster tomaat, paprika, ui en knoflook tot ze zacht en mooi gekleurd zijn. Doe alles in een pan met een beetje kookroom en pureer glad met de staafmixer.',ai('roasted%20tomato%20red%20pepper%20creamy%20sauce%20small%20bowl',62517));
+add(doc,sauces,'romige-wortel-knoflooksaus','🥕','Wortel-Knoflooksaus','Licht zoet • romig • kruidig',['Wortel','Ui','Knoflook','Kookroom','Gerookt paprikapoeder'],'Kook of rooster de wortel zacht. Bak ui en knoflook, voeg de wortel en kookroom toe en pureer glad. Breng op smaak met gerookt paprikapoeder.',ai('creamy%20carrot%20garlic%20sauce%20orange%20sauce%20small%20bowl',31852));
+add(doc,sauces,'romige-courgettesaus','🥒','Romige Courgettesaus','Zacht • fris • romig',['Courgette','Boter','Ui','Knoflook','Kookroom','Basilicum','Parmezaan','Zwarte peper'],'Bak courgette flink in boter met ui en knoflook. Voeg kookroom toe en pureer glad. Maak af met basilicum, Parmezaan en zwarte peper.',ai('creamy%20zucchini%20sauce%20green%20sauce%20basil%20small%20bowl',77420));
+add(doc,sauces,'geroosterde-ui-knoflooksaus','🧅🧄','Geroosterde Ui-Knoflooksaus','Zoet • hartig • krachtig',['Ui','Knoflook','Boter','Kookroom','Klein beetje Dijonmosterd'],'Bak de ui langzaam in boter tot hij diep goudbruin en zoet is. Voeg geroosterde knoflook en kookroom toe, pureer glad en maak af met een klein beetje Dijonmosterd.',ai('creamy%20roasted%20onion%20garlic%20sauce%20small%20bowl',24681));
+add(doc,sauces,'romige-maissaus','🌽','Romige Maïssaus','Zoet • rokerig • romig',['Maïs','Boter','Knoflook','Kookroom','Gerookt paprikapoeder'],'Bak de maïs stevig in boter tot hij hier en daar bruin wordt. Voeg knoflook en kookroom toe, breng op smaak met gerookt paprikapoeder en pureer glad.',ai('creamy%20corn%20sauce%20golden%20yellow%20small%20bowl',85731));
+add(doc,sauces,'romige-pompoensaus','🎃','Romige Pompoensaus','Vol • zacht • kruidig',['Pompoen','Knoflook','Kookroom','Tijm of rozemarijn','Parmezaan'],'Rooster de pompoen en knoflook tot ze zacht zijn. Voeg kookroom toe en pureer glad. Maak af met tijm of rozemarijn en Parmezaan.',ai('creamy%20pumpkin%20sauce%20orange%20sauce%20herbs%20small%20bowl',56204));
+var sides=ensureSection(doc,['bijgerechten'],'bijgerechten','BIJGERECHTEN','Bijgerechten');
+add(doc,sides,'crostini-di-fegatini','🇮🇹🍞','Crostini di Fegatini','Toscaanse kippenleverpaté • licht korrelig • voor op brood',['500 g kippenlevers','1 ui, fijgesneden','2 tenen knoflook, fijngehakt','3 el olijfolie','50 g boter','100 ml droge witte wijn','5–6 salieblaadjes','2 ansjovisfilets','1 el kappertjes','Zout en zwarte peper'],'Bak de ui 8–10 minuten zacht in olijfolie. Voeg knoflook, salie, ansjovis en kappertjes toe. Bak de kippenlevers 4–5 minuten mee, blus af met witte wijn en laat bijna volledig inkoken. Voeg de boter toe en pulseer kort, zodat de paté bewust licht grof en korrelig blijft. Laat minimaal 2 uur koelen en serveer op geroosterd brood.','https://image.pollinations.ai/prompt/rustic%20Italian%20crostini%20di%20fegatini%20Tuscan%20chicken%20liver%20pate%20on%20toasted%20baguette%20wooden%20board%20warm%20natural%20light%20realistic%20food%20photography%20no%20text?width=640&height=568&seed=18473&nologo=true');
+add(doc,sides,'romige-bundelzwammen-bosui-ketjap','🍄🌿','Romige Bundelzwammen met Bosui & Ketjap','Romig • hartig • licht zoetzuur • lekker met vers brood',['Bundelzwammen','Klontje roomboter','Beetje melk','Scheutje kookroom','Klein beetje sojasaus','Klein beetje ketjap manis','Paprikapoeder','Knoflookpoeder','Rozemarijn','Snufje MSG','Zwarte peper','Bosui, fijngesneden','Klein scheutje azijn','Zwarte sesamzaadjes','Vers brood van de bakker en roomboter, om erbij te serveren'],'Smelt een klontje boter op laag vuur en bak de bundelzwammen rustig. Voeg een beetje melk en een scheutje kookroom toe. Breng op smaak met sojasaus, ketjap, paprikapoeder, knoflookpoeder, rozemarijn, MSG en zwarte peper. Laat zachtjes indikken en schep het grootste gedeelte in een kom. Bak de bosui enkele minuten in de resten van de pan met een klein scheutje azijn. Verdeel dit over de romige bundelzwammen en werk af met zwarte sesamzaadjes. Serveer met vers bakkersbrood en roomboter.','https://image.pollinations.ai/prompt/creamy%20Asian%20fusion%20cluster%20mushrooms%20in%20a%20small%20rustic%20bowl%20topped%20with%20sauteed%20spring%20onion%20and%20black%20sesame%20seeds%20fresh%20artisan%20bread%20and%20butter%20beside%20it%20warm%20cozy%20restaurant%20lighting%20highly%20realistic%20food%20photography%20no%20text?width=640&height=568&seed=39172&nologo=true');
+var tea=ensureSection(doc,['theetjes','thee'],'theetjes','THEETJES','Theetjes');
+add(doc,tea,'citroen-kurkuma-chia-thee','🍋☕','Citroen-Kurkuma-Chia Thee','Warm • kruidig • fris',['1 citroen','Water','1 theelepel chiapoeder','1 theelepel kurkuma','Klein beetje zwarte peper'],'Doe de citroen in het water. Voeg chiapoeder, kurkuma en een klein beetje zwarte peper toe. Laat 10 minuten zacht koken. Zeef de thee daarna en serveer warm.',ai('warm%20lemon%20turmeric%20tea%20clear%20glass%20cup%20lemon%20turmeric',72941));
+return !!doc.getElementById('citroen-kurkuma-chia-thee')&&!!doc.getElementById('romige-paddenstoelensaus');}
+var tries=0;var timer=setInterval(function(){tries++;if(inject()||tries>40)clearInterval(timer);},250);document.getElementById('buikboek-frame').addEventListener('load',function(){inject();setTimeout(inject,500);setTimeout(inject,1500);});window.addEventListener('pageshow',inject);
+})();
+</script>
 </body>
 </html>
